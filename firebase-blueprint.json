@@ -1,0 +1,94 @@
+{
+  "entities": {
+    "ChatSession": {
+      "title": "Chat Session",
+      "description": "A collection of messages between the user and the AI.",
+      "type": "object",
+      "properties": {
+        "userId": {
+          "type": "string",
+          "description": "The ID of the user who owns this session."
+        },
+        "title": {
+          "type": "string",
+          "description": "The title of the chat session."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "When the session was created."
+        },
+        "updatedAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "When the session was last updated."
+        }
+      },
+      "required": ["userId", "createdAt", "updatedAt"]
+    },
+    "Message": {
+      "title": "Message",
+      "description": "A single message in a chat session.",
+      "type": "object",
+      "properties": {
+        "role": {
+          "type": "string",
+          "enum": ["user", "model"],
+          "description": "The role of the message sender."
+        },
+        "content": {
+          "type": "string",
+          "description": "The text content of the message."
+        },
+        "type": {
+          "type": "string",
+          "enum": ["text", "image"],
+          "description": "The type of message."
+        },
+        "imageUrl": {
+          "type": "string",
+          "description": "The URL of the generated image, if applicable."
+        },
+        "createdAt": {
+          "type": "string",
+          "format": "date-time",
+          "description": "When the message was sent."
+        }
+      },
+      "required": ["role", "content", "type", "createdAt"]
+    },
+    "UserProfile": {
+      "title": "User Profile",
+      "description": "Personalization details for the user.",
+      "type": "object",
+      "properties": {
+        "role": {
+          "type": "string",
+          "description": "The user's professional role (e.g., coder, student)."
+        },
+        "interests": {
+          "type": "string",
+          "description": "The user's interests."
+        },
+        "bio": {
+          "type": "string",
+          "description": "A short bio about the user."
+        }
+      }
+    }
+  },
+  "firestore": {
+    "/sessions/{sessionId}": {
+      "schema": "ChatSession",
+      "description": "Stores user chat sessions."
+    },
+    "/sessions/{sessionId}/messages/{messageId}": {
+      "schema": "Message",
+      "description": "Stores messages within a session."
+    },
+    "/users/{userId}/profile/data": {
+      "schema": "UserProfile",
+      "description": "Stores user personalization data."
+    }
+  }
+}

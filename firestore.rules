@@ -1,0 +1,39 @@
+rules_version = '2';
+service cloud.firestore {
+  match /databases/{database}/documents {
+    // Helper functions
+    function isAuthenticated() {
+      return request.auth != null;
+    }
+    
+    function isOwner(userId) {
+      return isAuthenticated() && request.auth.uid == userId;
+    }
+
+    function isSessionOwner(sessionId) {
+      return isAuthenticated() && get(/databases/$(database)/documents/sessions/$(sessionId)).data.userId == request.auth.uid;
+    }
+
+    // Sessions collection
+    match /sessions/{sessionId} {
+      allow read: if isOwner(resource.data.userId);
+      allow create: if isAuthenticated() && request.resource.data.userId == request.auth.uid;
+      allow update: if isOwner(resource.data.userId);
+      allow delete: if isOwner(resource.data.userId);
+
+      // Messages subcollection
+      match /messages/{messageId} {
+        allow read: if isSessionOwner(sessionId);
+        allow create: if isSessionOwner(sessionId);
+        allow update: if false; // Messages are immutable
+        allow delete: if isSessionOwner(sessionId);
+      }
+    }
+
+    // User Profile
+    match /users/{userId}/profile/data {
+      allow read: if isOwner(userId);
+      allow write: if isOwner(userId);
+    }
+  }
+}
