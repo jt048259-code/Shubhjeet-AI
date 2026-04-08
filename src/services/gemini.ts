@@ -1,6 +1,10 @@
 import { GoogleGenAI, GenerateContentResponse, Modality } from "@google/genai";
 
-const apiKey = process.env.GEMINI_API_KEY!;
+const getApiKey = () => {
+  return import.meta.env.VITE_GEMINI_API_KEY || process.env.GEMINI_API_KEY || '';
+};
+
+const apiKey = getApiKey();
 const ai = new GoogleGenAI({ apiKey });
 
 export const generateChatResponse = async (
@@ -62,7 +66,7 @@ Please use this information to personalize your responses and make them more rel
 
 export const generateVideo = async (prompt: string) => {
   try {
-    const currentApiKey = process.env.GEMINI_API_KEY!;
+    const currentApiKey = getApiKey();
     const currentAi = new GoogleGenAI({ apiKey: currentApiKey });
     const model = 'veo-3.1-fast-generate-preview';
     
@@ -119,8 +123,10 @@ export const generatePDFContent = async (topic: string) => {
   });
   
   try {
-    return JSON.parse(response.text);
+    const text = response.text.replace(/```json|```/g, "").trim();
+    return JSON.parse(text);
   } catch (e) {
+    console.error("PDF Content Parse Error:", e, response.text);
     return null;
   }
 };

@@ -29,6 +29,12 @@ declare global {
       openSelectKey: () => Promise<void>;
     };
   }
+  interface ImportMeta {
+    readonly env: {
+      readonly [key: string]: string | boolean | undefined;
+      readonly VITE_GEMINI_API_KEY?: string;
+    };
+  }
 }
 
 
