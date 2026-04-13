@@ -1,5 +1,7 @@
 {
-  "name": "Shubhjeet AI",
-  "description": "A powerful AI assistant for chat and image generation, powered by Gemini.",
-  "requestFramePermissions": []
+  "name": "SSM Teacher Portal",
+  "description": "A comprehensive management portal for S.S.M Sr. Sec. School teachers and administrators, featuring attendance tracking, leave management, and AI-powered scheduling.",
+  "requestFramePermissions": [
+    "geolocation"
+  ]
 }

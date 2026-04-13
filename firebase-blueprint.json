@@ -1,94 +1,92 @@
 {
   "entities": {
-    "ChatSession": {
-      "title": "Chat Session",
-      "description": "A collection of messages between the user and the AI.",
+    "User": {
+      "title": "User",
+      "description": "System users (Teachers and Admins)",
       "type": "object",
       "properties": {
-        "userId": {
-          "type": "string",
-          "description": "The ID of the user who owns this session."
-        },
-        "title": {
-          "type": "string",
-          "description": "The title of the chat session."
-        },
-        "createdAt": {
-          "type": "string",
-          "format": "date-time",
-          "description": "When the session was created."
-        },
-        "updatedAt": {
-          "type": "string",
-          "format": "date-time",
-          "description": "When the session was last updated."
-        }
+        "uid": { "type": "string" },
+        "name": { "type": "string" },
+        "email": { "type": "string" },
+        "role": { "type": "string", "enum": ["teacher", "admin"] },
+        "mobile": { "type": "string" },
+        "classLevel": { "type": "string" },
+        "subjects": { "type": "array", "items": { "type": "string" } },
+        "createdAt": { "type": "string", "format": "date-time" }
       },
-      "required": ["userId", "createdAt", "updatedAt"]
+      "required": ["uid", "name", "role"]
     },
-    "Message": {
-      "title": "Message",
-      "description": "A single message in a chat session.",
+    "AttendanceCode": {
+      "title": "Attendance Code",
+      "description": "6-digit unique code for attendance marking",
       "type": "object",
       "properties": {
-        "role": {
-          "type": "string",
-          "enum": ["user", "model"],
-          "description": "The role of the message sender."
-        },
-        "content": {
-          "type": "string",
-          "description": "The text content of the message."
-        },
-        "type": {
-          "type": "string",
-          "enum": ["text", "image"],
-          "description": "The type of message."
-        },
-        "imageUrl": {
-          "type": "string",
-          "description": "The URL of the generated image, if applicable."
-        },
-        "createdAt": {
-          "type": "string",
-          "format": "date-time",
-          "description": "When the message was sent."
-        }
+        "code": { "type": "string" },
+        "createdBy": { "type": "string" },
+        "expiresAt": { "type": "string", "format": "date-time" },
+        "createdAt": { "type": "string", "format": "date-time" }
       },
-      "required": ["role", "content", "type", "createdAt"]
+      "required": ["code", "expiresAt"]
     },
-    "UserProfile": {
-      "title": "User Profile",
-      "description": "Personalization details for the user.",
+    "Attendance": {
+      "title": "Attendance",
+      "description": "Attendance records marked by teachers",
       "type": "object",
       "properties": {
-        "role": {
-          "type": "string",
-          "description": "The user's professional role (e.g., coder, student)."
-        },
-        "interests": {
-          "type": "string",
-          "description": "The user's interests."
-        },
-        "bio": {
-          "type": "string",
-          "description": "A short bio about the user."
-        }
+        "teacherId": { "type": "string" },
+        "teacherName": { "type": "string" },
+        "date": { "type": "string", "format": "date" },
+        "timestamp": { "type": "string", "format": "date-time" }
+      },
+      "required": ["teacherId", "date"]
+    },
+    "LeaveApplication": {
+      "title": "Leave Application",
+      "description": "Leave requests submitted by teachers",
+      "type": "object",
+      "properties": {
+        "teacherId": { "type": "string" },
+        "teacherName": { "type": "string" },
+        "startDate": { "type": "string", "format": "date" },
+        "endDate": { "type": "string", "format": "date" },
+        "reason": { "type": "string" },
+        "mobile": { "type": "string" },
+        "status": { "type": "string", "enum": ["pending", "approved", "rejected"] },
+        "createdAt": { "type": "string", "format": "date-time" }
+      },
+      "required": ["teacherId", "startDate", "endDate", "status"]
+    },
+    "TimeTable": {
+      "title": "Time Table",
+      "description": "School time table data",
+      "type": "object",
+      "properties": {
+        "classLevel": { "type": "string" },
+        "day": { "type": "string" },
+        "schedule": { "type": "array" }
       }
     }
   },
   "firestore": {
-    "/sessions/{sessionId}": {
-      "schema": "ChatSession",
-      "description": "Stores user chat sessions."
+    "/users/{userId}": {
+      "schema": "User",
+      "description": "User profiles"
     },
-    "/sessions/{sessionId}/messages/{messageId}": {
-      "schema": "Message",
-      "description": "Stores messages within a session."
+    "/attendanceCodes/{codeId}": {
+      "schema": "AttendanceCode",
+      "description": "Active attendance codes"
     },
-    "/users/{userId}/profile/data": {
-      "schema": "UserProfile",
-      "description": "Stores user personalization data."
+    "/attendance/{recordId}": {
+      "schema": "Attendance",
+      "description": "Attendance logs"
+    },
+    "/leaves/{leaveId}": {
+      "schema": "LeaveApplication",
+      "description": "Leave requests"
+    },
+    "/timetable/{tableId}": {
+      "schema": "TimeTable",
+      "description": "Time table records"
     }
   }
 }

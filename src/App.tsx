@@ -1,1097 +1,587 @@
-/**
- * @license
- * SPDX-License-Identifier: Apache-2.0
- */
-
-import React, { useState, useEffect, useRef } from 'react';
+import React, { useState, useEffect } from 'react';
+import { 
+  Users, 
+  Calendar, 
+  ClipboardCheck, 
+  FileText, 
+  Clock, 
+  LogOut, 
+  Plus, 
+  Download, 
+  UserPlus,
+  ShieldCheck,
+  ChevronRight,
+  Menu,
+  X,
+  AlertCircle
+} from 'lucide-react';
+import { motion, AnimatePresence } from 'motion/react';
+import { 
+  signInWithEmailAndPassword,
+  createUserWithEmailAndPassword,
+  onAuthStateChanged, 
+  signOut,
+  User as FirebaseUser
+} from 'firebase/auth';
 import { 
   collection, 
   query, 
-  orderBy, 
+  where, 
   onSnapshot, 
   addDoc, 
   serverTimestamp, 
-  doc, 
-  updateDoc,
   getDocs,
-  where,
-  setDoc,
+  doc,
   getDoc,
-  getDocFromServer
+  setDoc,
+  Timestamp,
+  orderBy,
+  limit
 } from 'firebase/firestore';
-import { onAuthStateChanged, User } from 'firebase/auth';
-import { auth, db, signIn, logOut } from './firebase';
-import { Message, ChatSession, UserProfile } from './types';
-import { 
-  generateChatResponse, 
-  generateImage, 
-  generateSpeech, 
-  generateVideo,
-  generatePDFContent 
-} from './services/gemini';
+import { auth, db } from './firebase';
+import * as XLSX from 'xlsx';
+import { format, addMinutes, isAfter } from 'date-fns';
 
-enum OperationType {
-  CREATE = 'create',
-  UPDATE = 'update',
-  DELETE = 'delete',
-  LIST = 'list',
-  GET = 'get',
-  WRITE = 'write',
+// --- Types ---
+type Role = 'teacher' | 'admin' | null;
+
+interface UserProfile {
+  uid: string;
+  name: string;
+  email: string;
+  role: Role;
+  mobile?: string;
+  classLevel?: string;
+  subjects?: string[];
+  createdAt?: any;
 }
 
-interface FirestoreErrorInfo {
-  error: string;
-  operationType: OperationType;
-  path: string | null;
-  authInfo: {
-    userId: string | undefined;
-    email: string | null | undefined;
-    emailVerified: boolean | undefined;
-    isAnonymous: boolean | undefined;
-    tenantId: string | null | undefined;
-    providerInfo: {
-      providerId: string;
-      displayName: string | null;
-      email: string | null;
-      photoUrl: string | null;
-    }[];
-  }
+interface AttendanceRecord {
+  id: string;
+  teacherId: string;
+  teacherName: string;
+  date: string;
+  timestamp: any;
 }
 
-function handleFirestoreError(error: unknown, operationType: OperationType, path: string | null) {
-  const errInfo: FirestoreErrorInfo = {
-    error: error instanceof Error ? error.message : String(error),
-    authInfo: {
-      userId: auth.currentUser?.uid,
-      email: auth.currentUser?.email,
-      emailVerified: auth.currentUser?.emailVerified,
-      isAnonymous: auth.currentUser?.isAnonymous,
-      tenantId: auth.currentUser?.tenantId,
-      providerInfo: auth.currentUser?.providerData.map(provider => ({
-        providerId: provider.providerId,
-        displayName: provider.displayName,
-        email: provider.email,
-        photoUrl: provider.photoURL
-      })) || []
-    },
-    operationType,
-    path
-  }
-  console.error('Firestore Error: ', JSON.stringify(errInfo));
-  throw new Error(JSON.stringify(errInfo));
+interface LeaveRequest {
+  id: string;
+  teacherId: string;
+  teacherName: string;
+  startDate: string;
+  endDate: string;
+  reason: string;
+  mobile: string;
+  status: 'pending' | 'approved' | 'rejected';
+  createdAt: any;
 }
 
-import { 
-  Send, 
-  Plus, 
-  Image as ImageIcon, 
-  LogOut, 
-  MessageSquare, 
-  User as UserIcon, 
-  Bot, 
-  Loader2,
-  Trash2,
-  Menu,
-  X,
-  Sparkles,
-  Volume2,
-  VolumeX,
-  Settings,
-  Download,
-  Save,
-  Video,
-  FileText,
-  Target,
-  ShieldAlert
-} from 'lucide-react';
-import { jsPDF } from 'jspdf';
-import ReactMarkdown from 'react-markdown';
-import { clsx, type ClassValue } from 'clsx';
-import { twMerge } from 'tailwind-merge';
-import { motion, AnimatePresence } from 'motion/react';
+// --- Components ---
 
-function cn(...inputs: ClassValue[]) {
-  return twMerge(clsx(inputs));
-}
+const Navbar = ({ user, role, onLogout }: { user: FirebaseUser | null, role: Role, onLogout: () => void }) => (
+  <nav className="bg-indigo-600 text-white p-4 shadow-lg flex justify-between items-center">
+    <div className="flex items-center gap-2">
+      <ShieldCheck className="w-8 h-8" />
+      <span className="font-bold text-xl tracking-tight">SSM Portal</span>
+    </div>
+    {user && (
+      <div className="flex items-center gap-4">
+        <div className="hidden md:block text-right">
+          <p className="text-sm font-medium">{user.displayName}</p>
+          <p className="text-xs opacity-75 capitalize">{role}</p>
+        </div>
+        <button 
+          onClick={onLogout}
+          className="p-2 hover:bg-indigo-700 rounded-full transition-colors"
+        >
+          <LogOut className="w-5 h-5" />
+        </button>
+      </div>
+    )}
+  </nav>
+);
+
+const Card = ({ title, icon: Icon, children, className = "" }: any) => (
+  <motion.div 
+    initial={{ opacity: 0, y: 20 }}
+    animate={{ opacity: 1, y: 0 }}
+    className={`bg-white rounded-2xl shadow-sm border border-gray-100 p-6 ${className}`}
+  >
+    <div className="flex items-center gap-3 mb-6">
+      <div className="p-3 bg-indigo-50 rounded-xl text-indigo-600">
+        <Icon className="w-6 h-6" />
+      </div>
+      <h3 className="text-lg font-semibold text-gray-800">{title}</h3>
+    </div>
+    {children}
+  </motion.div>
+);
 
 export default function App() {
-  const [user, setUser] = useState<User | null>(null);
-  const [sessions, setSessions] = useState<ChatSession[]>([]);
-  const [currentSessionId, setCurrentSessionId] = useState<string | null>(null);
-  const [messages, setMessages] = useState<Message[]>([]);
-  const [input, setInput] = useState('');
-  const [isLoading, setIsLoading] = useState(false);
-  const [isSidebarOpen, setIsSidebarOpen] = useState(true);
-  const [isProfileModalOpen, setIsProfileModalOpen] = useState(false);
-  const [userProfile, setUserProfile] = useState<UserProfile>({ role: '', interests: '', bio: '' });
-  const [playingAudioId, setPlayingAudioId] = useState<string | null>(null);
-  const [selectedFile, setSelectedFile] = useState<{ data: string; mimeType: string; name: string } | null>(null);
-  const [focusMode, setFocusMode] = useState(false);
-  const [focusTopic, setFocusTopic] = useState('');
-  const [isFocusTopicModalOpen, setIsFocusTopicModalOpen] = useState(false);
-  const [isKeySelectionNeeded, setIsKeySelectionNeeded] = useState(false);
-  const audioRef = useRef<HTMLAudioElement | null>(null);
-  const messagesEndRef = useRef<HTMLDivElement>(null);
-  const fileInputRef = useRef<HTMLInputElement>(null);
+  const [user, setUser] = useState<FirebaseUser | null>(null);
+  const [userProfile, setUserProfile] = useState<UserProfile | null>(null);
+  const [loading, setLoading] = useState(true);
+  const [view, setView] = useState<'home' | 'login-selection' | 'teacher-portal' | 'admin-portal' | 'teacher-login' | 'teacher-signup'>('home');
+  const [attendanceCode, setAttendanceCode] = useState<string | null>(null);
+  const [leaves, setLeaves] = useState<LeaveRequest[]>([]);
+  const [attendance, setAttendance] = useState<AttendanceRecord[]>([]);
+  
+  // Form states
+  const [teacherAuth, setTeacherAuth] = useState({ id: '', pass: '' });
+  const [signupForm, setSignupForm] = useState({ name: '', mobile: '', id: '', pass: '', classLevel: '6', subject: '' });
+  const [leaveForm, setLeaveForm] = useState({ startDate: '', endDate: '', reason: '', mobile: '' });
+  const [adminLogin, setAdminLogin] = useState({ id: '', pass: '' });
+  const [error, setError] = useState<string | null>(null);
 
   useEffect(() => {
-    const testConnection = async () => {
-      try {
-        await getDocFromServer(doc(db, 'test', 'connection'));
-      } catch (error) {
-        if(error instanceof Error && error.message.includes('the client is offline')) {
-          console.error("Please check your Firebase configuration. ");
-        }
-      }
-    }
-    testConnection();
-
     const unsubscribe = onAuthStateChanged(auth, async (u) => {
       setUser(u);
       if (u) {
-        // Fetch user profile
-        try {
-          const profileDoc = await getDoc(doc(db, 'users', u.uid, 'profile', 'data'));
-          if (profileDoc.exists()) {
-            setUserProfile(profileDoc.data() as UserProfile);
-          }
-        } catch (error) {
-          handleFirestoreError(error, OperationType.GET, `users/${u.uid}/profile/data`);
+        const docRef = doc(db, 'users', u.uid);
+        const docSnap = await getDoc(docRef);
+        if (docSnap.exists()) {
+          const profile = docSnap.data() as UserProfile;
+          setUserProfile(profile);
+          setView(profile.role === 'admin' ? 'admin-portal' : 'teacher-portal');
+        } else {
+          // If user exists in Auth but not in Firestore, they might be in middle of signup
+          // or an admin who hasn't been initialized.
+          setView('home');
         }
       } else {
-        setSessions([]);
-        setCurrentSessionId(null);
-        setMessages([]);
-        setUserProfile({ role: '', interests: '', bio: '' });
+        setView('home');
       }
+      setLoading(false);
     });
-    return () => unsubscribe();
+    return unsubscribe;
   }, []);
 
+  // Listeners for Admin/Teacher data
   useEffect(() => {
-    if (!user) return;
+    if (!user || !userProfile) return;
 
-    const q = query(
-      collection(db, 'sessions'),
-      where('userId', '==', user.uid),
-      orderBy('updatedAt', 'desc')
-    );
+    let unsubLeaves: any;
+    let unsubAttendance: any;
+    let unsubCode: any;
 
-    const unsubscribe = onSnapshot(q, (snapshot) => {
-      const sessionList = snapshot.docs.map(doc => ({
-        id: doc.id,
-        ...doc.data()
-      })) as ChatSession[];
-      setSessions(sessionList);
-    }, (error) => {
-      handleFirestoreError(error, OperationType.LIST, 'sessions');
-    });
-
-    return () => unsubscribe();
-  }, [user]);
-
-  useEffect(() => {
-    if (!currentSessionId) {
-      setMessages([]);
-      return;
-    }
-
-    const q = query(
-      collection(db, 'sessions', currentSessionId, 'messages'),
-      orderBy('createdAt', 'asc')
-    );
-
-    const unsubscribe = onSnapshot(q, (snapshot) => {
-      const messageList = snapshot.docs.map(doc => ({
-        id: doc.id,
-        ...doc.data()
-      })) as Message[];
-      setMessages(messageList);
-    }, (error) => {
-      handleFirestoreError(error, OperationType.LIST, `sessions/${currentSessionId}/messages`);
-    });
-
-    return () => unsubscribe();
-  }, [currentSessionId]);
-
-  useEffect(() => {
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
-  }, [messages]);
-
-  const handlePlayAudio = async (message: Message) => {
-    if (playingAudioId === message.id) {
-      audioRef.current?.pause();
-      setPlayingAudioId(null);
-      return;
-    }
-
-    try {
-      setPlayingAudioId(message.id!);
-      const audioUrl = await generateSpeech(message.content);
-      if (audioUrl) {
-        if (audioRef.current) {
-          audioRef.current.src = audioUrl;
-          audioRef.current.play();
-        } else {
-          const audio = new Audio(audioUrl);
-          audioRef.current = audio;
-          audio.play();
-        }
-        audioRef.current!.onended = () => setPlayingAudioId(null);
-      } else {
-        setPlayingAudioId(null);
-      }
-    } catch (error) {
-      console.error("Audio error:", error);
-      setPlayingAudioId(null);
-    }
-  };
-
-  const createNewSession = async () => {
-    if (!user) return;
-    const newSession = {
-      userId: user.uid,
-      title: 'New Chat',
-      createdAt: serverTimestamp(),
-      updatedAt: serverTimestamp(),
-    };
-    try {
-      const docRef = await addDoc(collection(db, 'sessions'), newSession);
-      setCurrentSessionId(docRef.id);
-      setIsSidebarOpen(false);
-    } catch (error) {
-      handleFirestoreError(error, OperationType.CREATE, 'sessions');
-    }
-  };
-
-  const saveProfile = async () => {
-    if (!user) return;
-    const path = `users/${user.uid}/profile/data`;
-    try {
-      await setDoc(doc(db, path), userProfile);
-      setIsProfileModalOpen(false);
-    } catch (error) {
-      handleFirestoreError(error, OperationType.WRITE, path);
-    }
-  };
-
-  const downloadImage = async (url: string, filename: string) => {
-    try {
-      const response = await fetch(url);
-      const blob = await response.blob();
-      const blobUrl = window.URL.createObjectURL(blob);
-      const link = document.createElement('a');
-      link.href = blobUrl;
-      link.download = filename;
-      document.body.appendChild(link);
-      link.click();
-      document.body.removeChild(link);
-      window.URL.revokeObjectURL(blobUrl);
-    } catch (error) {
-      console.error("Download error:", error);
-    }
-  };
-
-  const resizeImage = (base64Str: string, maxWidth = 1024, maxHeight = 1024): Promise<string> => {
-    return new Promise((resolve) => {
-      const img = new Image();
-      img.src = base64Str;
-      img.onload = () => {
-        const canvas = document.createElement('canvas');
-        let width = img.width;
-        let height = img.height;
-
-        if (width > height) {
-          if (width > maxWidth) {
-            height *= maxWidth / width;
-            width = maxWidth;
-          }
-        } else {
-          if (height > maxHeight) {
-            width *= maxHeight / height;
-            height = maxHeight;
-          }
-        }
-
-        canvas.width = width;
-        canvas.height = height;
-        const ctx = canvas.getContext('2d');
-        if (ctx) {
-          ctx.drawImage(img, 0, 0, width, height);
-          
-          // Add watermark: Shubhjeet AI
-          const padding = 15;
-          const fontSize = Math.max(12, Math.floor(width / 40));
-          ctx.font = `bold ${fontSize}px sans-serif`;
-          ctx.fillStyle = 'rgba(255, 255, 255, 0.6)';
-          ctx.textAlign = 'right';
-          ctx.textBaseline = 'bottom';
-          
-          // Shadow for readability
-          ctx.shadowColor = 'rgba(0, 0, 0, 0.5)';
-          ctx.shadowBlur = 4;
-          ctx.shadowOffsetX = 1;
-          ctx.shadowOffsetY = 1;
-          
-          ctx.fillText('Shubhjeet AI', width - padding, height - padding);
-        }
-        resolve(canvas.toDataURL('image/jpeg', 0.85)); // Better quality for watermark
-      };
-    });
-  };
-
-  const handleFileSelect = (e: React.ChangeEvent<HTMLInputElement>) => {
-    const file = e.target.files?.[0];
-    if (!file) return;
-
-    const reader = new FileReader();
-    reader.onload = (event) => {
-      const base64 = event.target?.result as string;
-      setSelectedFile({
-        data: base64,
-        mimeType: file.type,
-        name: file.name
+    if (userProfile.role === 'admin') {
+      unsubLeaves = onSnapshot(collection(db, 'leaves'), (snap) => {
+        setLeaves(snap.docs.map(d => ({ id: d.id, ...d.data() } as LeaveRequest)));
       });
-    };
-    reader.readAsDataURL(file);
-  };
-
-  useEffect(() => {
-    if (currentSessionId) {
-      const session = sessions.find(s => s.id === currentSessionId);
-      if (session) {
-        setFocusMode(session.focusMode || false);
-        setFocusTopic(session.focusTopic || '');
-      }
-    }
-  }, [currentSessionId, sessions]);
-
-  const handleToggleFocusMode = async () => {
-    if (!currentSessionId) return;
-    const newFocusMode = !focusMode;
-    setFocusMode(newFocusMode);
-    
-    if (newFocusMode && !focusTopic) {
-      setIsFocusTopicModalOpen(true);
+      unsubAttendance = onSnapshot(collection(db, 'attendance'), (snap) => {
+        setAttendance(snap.docs.map(d => ({ id: d.id, ...d.data() } as AttendanceRecord)));
+      });
     } else {
-      await updateDoc(doc(db, 'sessions', currentSessionId), { focusMode: newFocusMode });
+      const q = query(collection(db, 'leaves'), where('teacherId', '==', user.uid));
+      unsubLeaves = onSnapshot(q, (snap) => {
+        setLeaves(snap.docs.map(d => ({ id: d.id, ...d.data() } as LeaveRequest)));
+      });
+    }
+
+    unsubCode = onSnapshot(query(collection(db, 'attendanceCodes'), orderBy('createdAt', 'desc'), limit(1)), (snap) => {
+      if (!snap.empty) {
+        const data = snap.docs[0].data();
+        if (isAfter(new Date(data.expiresAt), new Date())) {
+          setAttendanceCode(data.code);
+        } else {
+          setAttendanceCode(null);
+        }
+      }
+    });
+
+    return () => {
+      unsubLeaves?.();
+      unsubAttendance?.();
+      unsubCode?.();
+    };
+  }, [user, userProfile]);
+
+  const handleTeacherLogin = async () => {
+    try {
+      setError(null);
+      const email = `${teacherAuth.id}@ssm.portal`;
+      await signInWithEmailAndPassword(auth, email, teacherAuth.pass);
+    } catch (err: any) {
+      console.error(err);
+      setError("Invalid ID or Password");
     }
   };
 
-  const handleSetFocusTopic = async (topic: string) => {
-    if (!currentSessionId) return;
-    setFocusTopic(topic);
-    setIsFocusTopicModalOpen(false);
-    await updateDoc(doc(db, 'sessions', currentSessionId), { 
-      focusMode: true,
-      focusTopic: topic 
+  const handleTeacherSignup = async () => {
+    try {
+      setError(null);
+      if (!signupForm.id || !signupForm.pass || !signupForm.name) {
+        setError("Please fill all required fields");
+        return;
+      }
+      const email = `${signupForm.id}@ssm.portal`;
+      const userCredential = await createUserWithEmailAndPassword(auth, email, signupForm.pass);
+      const u = userCredential.user;
+      
+      const profile: UserProfile = {
+        uid: u.uid,
+        name: signupForm.name,
+        email: email,
+        role: 'teacher',
+        mobile: signupForm.mobile,
+        classLevel: signupForm.classLevel,
+        subjects: [signupForm.subject],
+        createdAt: serverTimestamp() as any
+      };
+      await setDoc(doc(db, 'users', u.uid), profile);
+      setUserProfile(profile);
+      setView('teacher-portal');
+    } catch (err: any) {
+      console.error(err);
+      setError(err.message || "Signup failed");
+    }
+  };
+
+  const handleAdminLogin = async () => {
+    if (adminLogin.id === 'SSM100728' && adminLogin.pass === '9923123') {
+      try {
+        // For admin, we use a fixed email to ensure they can always log in
+        const email = "admin@ssm.portal";
+        const pass = "9923123admin"; // Internal complex pass
+        
+        let u;
+        try {
+          const cred = await signInWithEmailAndPassword(auth, email, pass);
+          u = cred.user;
+        } catch (e) {
+          const cred = await createUserWithEmailAndPassword(auth, email, pass);
+          u = cred.user;
+        }
+
+        await setDoc(doc(db, 'users', u.uid), {
+          uid: u.uid,
+          name: 'School Admin',
+          email: email,
+          role: 'admin',
+          createdAt: serverTimestamp()
+        });
+        setUserProfile({ uid: u.uid, name: 'School Admin', email: email, role: 'admin' });
+        setView('admin-portal');
+      } catch (err) {
+        console.error(err);
+        setError("Admin initialization failed");
+      }
+    } else {
+      setError("Invalid Admin Credentials");
+    }
+  };
+
+  const markAttendance = async (inputCode: string) => {
+    if (!user || !userProfile) return;
+    if (inputCode === attendanceCode) {
+      const today = format(new Date(), 'yyyy-MM-dd');
+      const q = query(collection(db, 'attendance'), where('teacherId', '==', user.uid), where('date', '==', today));
+      const snap = await getDocs(q);
+      
+      if (snap.empty) {
+        await addDoc(collection(db, 'attendance'), {
+          teacherId: user.uid,
+          teacherName: userProfile.name,
+          date: today,
+          timestamp: serverTimestamp()
+        });
+        alert("Attendance marked successfully!");
+      } else {
+        alert("Attendance already marked for today.");
+      }
+    } else {
+      alert("Invalid or expired code.");
+    }
+  };
+
+  const submitLeave = async () => {
+    if (!user || !userProfile) return;
+    await addDoc(collection(db, 'leaves'), {
+      ...leaveForm,
+      teacherId: user.uid,
+      teacherName: userProfile.name,
+      status: 'pending',
+      createdAt: serverTimestamp()
+    });
+    setLeaveForm({ startDate: '', endDate: '', reason: '', mobile: '' });
+    alert("Leave application submitted.");
+  };
+
+  const generateCode = async () => {
+    const code = Math.floor(100000 + Math.random() * 900000).toString();
+    await addDoc(collection(db, 'attendanceCodes'), {
+      code,
+      expiresAt: addMinutes(new Date(), 5).toISOString(),
+      createdAt: serverTimestamp()
     });
   };
 
-  const handleGeneratePDF = async (topic: string) => {
-    if (!currentSessionId || !user) return;
-    setIsLoading(true);
-    try {
-      const content = await generatePDFContent(topic);
-      if (!content) throw new Error("Failed to generate PDF content. The AI might have returned an invalid response.");
-
-      const imageResult = await generateImage(content.imagePrompt);
-      let finalImageUrl = null;
-      if (imageResult.imageUrl) {
-        finalImageUrl = await resizeImage(imageResult.imageUrl, 1024, 1024);
-      }
-      
-      const doc = new jsPDF();
-      
-      // Title
-      doc.setFont("helvetica", "bold");
-      doc.setFontSize(22);
-      const titleLines = doc.splitTextToSize(content.title, 170);
-      doc.text(titleLines, 20, 30);
-      
-      // Content
-      doc.setFont("helvetica", "normal");
-      doc.setFontSize(12);
-      const splitText = doc.splitTextToSize(content.content, 170);
-      doc.text(splitText, 20, 50);
-
-      // Image
-      if (finalImageUrl) {
-        // Calculate position based on text height
-        const textHeight = splitText.length * 7; // Approx height
-        const imageY = Math.max(150, 60 + textHeight);
-        doc.addImage(finalImageUrl, 'JPEG', 20, imageY, 170, 100);
-      }
-
-      // Footer
-      doc.setFontSize(10);
-      doc.setTextColor(150);
-      doc.text(`Generated by Shubhjeet AI - ${new Date().toLocaleDateString()}`, 105, 285, { align: 'center' });
-
-      const pdfBlob = doc.output('blob');
-      const pdfUrl = URL.createObjectURL(pdfBlob);
-
-      const botMessage: Message = {
-        role: 'model',
-        content: `I've generated a professional PDF for you about "${topic}". You can view and download it below.`,
-        type: 'pdf',
-        pdfUrl: pdfUrl,
-        fileName: `${topic.replace(/\s+/g, '_')}.pdf`,
-        createdAt: serverTimestamp(),
-      };
-      await addDoc(collection(db, 'sessions', currentSessionId, 'messages'), botMessage);
-    } catch (error) {
-      console.error("PDF Generation Error:", error);
-      const errorMessage: Message = {
-        role: 'model',
-        content: `Sorry, I encountered an error while generating your PDF: ${error instanceof Error ? error.message : 'Unknown error'}. Please try again with a different topic.`,
-        type: 'text',
-        createdAt: serverTimestamp(),
-      };
-      await addDoc(collection(db, 'sessions', currentSessionId, 'messages'), errorMessage);
-    } finally {
-      setIsLoading(false);
-    }
+  const exportToExcel = (data: any[], fileName: string) => {
+    const ws = XLSX.utils.json_to_sheet(data);
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, "Sheet1");
+    XLSX.writeFile(wb, `${fileName}.xlsx`);
   };
 
-  const handleSend = async (e?: React.FormEvent, type: 'text' | 'image' | 'video' | 'pdf' = 'text') => {
-    if (e) e.preventDefault();
-    const trimmedInput = input.trim();
-    if ((!trimmedInput && !selectedFile) || !user || isLoading) return;
-
-    let actualType = type;
-    const lowerInput = trimmedInput.toLowerCase();
-    
-    if (lowerInput.includes('generate video') || lowerInput.includes('make a video') || lowerInput.includes('create video')) {
-      actualType = 'video';
-      // Check for API key for Veo
-      if (window.aistudio) {
-        const hasKey = await window.aistudio.hasSelectedApiKey();
-        if (!hasKey) {
-          setIsKeySelectionNeeded(true);
-          return;
-        }
-      }
-    } else if (lowerInput.includes('generate image') || lowerInput.includes('imagine image') || lowerInput.includes('create image')) {
-      actualType = 'image';
-    } else if (lowerInput.includes('generate pdf') || lowerInput.includes('make a pdf') || lowerInput.includes('create pdf')) {
-      actualType = 'pdf';
-    }
-
-    let sessionId = currentSessionId;
-    if (!sessionId) {
-      const newSession = {
-        userId: user.uid,
-        title: trimmedInput ? (trimmedInput.slice(0, 30) + (trimmedInput.length > 30 ? '...' : '')) : (selectedFile?.name || 'New Chat'),
-        focusMode: focusMode,
-        focusTopic: focusTopic,
-        createdAt: serverTimestamp(),
-        updatedAt: serverTimestamp(),
-      };
-      const docRef = await addDoc(collection(db, 'sessions'), newSession);
-      sessionId = docRef.id;
-      setCurrentSessionId(sessionId);
-    }
-
-    const userMessage: any = {
-      role: 'user',
-      content: trimmedInput || (selectedFile ? `Uploaded file: ${selectedFile.name}` : ''),
-      type: selectedFile ? 'file' : 'text',
-      createdAt: serverTimestamp(),
-    };
-
-    if (selectedFile) {
-      userMessage.fileData = selectedFile.data;
-      userMessage.fileMimeType = selectedFile.mimeType;
-      userMessage.fileName = selectedFile.name;
-    }
-
-    const currentFile = selectedFile;
-    setSelectedFile(null);
-    setInput('');
-    setIsLoading(true);
-
-    try {
-      await addDoc(collection(db, 'sessions', sessionId, 'messages'), userMessage);
-      await updateDoc(doc(db, 'sessions', sessionId), { updatedAt: serverTimestamp() });
-
-      if (actualType === 'image' && !currentFile) {
-        const result = await generateImage(trimmedInput);
-        if (result.imageUrl) {
-          const compressedImageUrl = await resizeImage(result.imageUrl);
-          const botMessage: Message = {
-            role: 'model',
-            content: `Generated image for: ${trimmedInput}`,
-            type: 'image',
-            imageUrl: compressedImageUrl,
-            createdAt: serverTimestamp(),
-          };
-          await addDoc(collection(db, 'sessions', sessionId, 'messages'), botMessage);
-        } else {
-          const botMessage: Message = {
-            role: 'model',
-            content: result.error || 'Sorry, I could not generate the image.',
-            type: 'text',
-            createdAt: serverTimestamp(),
-          };
-          await addDoc(collection(db, 'sessions', sessionId, 'messages'), botMessage);
-        }
-      } else if (actualType === 'video' && !currentFile) {
-        const result = await generateVideo(trimmedInput);
-        if (result.videoUrl) {
-          const botMessage: Message = {
-            role: 'model',
-            content: `Generated video for: ${trimmedInput}`,
-            type: 'video',
-            videoUrl: result.videoUrl,
-            createdAt: serverTimestamp(),
-          };
-          await addDoc(collection(db, 'sessions', sessionId, 'messages'), botMessage);
-        } else {
-          if ((result as any).needsKeyReset) {
-            setIsKeySelectionNeeded(true);
-          }
-          const botMessage: Message = {
-            role: 'model',
-            content: result.error || 'Sorry, I could not generate the video.',
-            type: 'text',
-            createdAt: serverTimestamp(),
-          };
-          await addDoc(collection(db, 'sessions', sessionId, 'messages'), botMessage);
-        }
-      } else if (actualType === 'pdf' && !currentFile) {
-        await handleGeneratePDF(trimmedInput.replace(/generate pdf|make a pdf|create pdf/gi, '').trim() || 'General Topic');
-      } else {
-        const history = messages.map(m => ({
-          role: m.role,
-          parts: m.type === 'file' ? [
-            { text: m.content },
-            { inlineData: { data: m.fileData?.split(',')[1] || m.fileData, mimeType: m.fileMimeType } }
-          ] : [{ text: m.content }]
-        }));
-        const aiResponse = await generateChatResponse(
-          trimmedInput || (currentFile ? `Please analyze this file: ${currentFile.name}` : ''), 
-          history, 
-          userProfile,
-          currentFile ? { data: currentFile.data, mimeType: currentFile.mimeType } : undefined,
-          { active: focusMode, topic: focusTopic }
-        );
-        const botMessage: Message = {
-          role: 'model',
-          content: aiResponse || 'Sorry, I could not generate a response.',
-          type: 'text',
-          createdAt: serverTimestamp(),
-        };
-        await addDoc(collection(db, 'sessions', sessionId, 'messages'), botMessage);
-      }
-    } catch (error) {
-      handleFirestoreError(error, OperationType.WRITE, `sessions/${sessionId}/messages`);
-    } finally {
-      setIsLoading(false);
-    }
-  };
-
-  if (!user) {
-    return (
-      <div className="min-h-screen bg-[#050505] flex flex-col items-center justify-center p-4 text-white font-sans">
-        <motion.div 
-          initial={{ opacity: 0, y: 20 }}
-          animate={{ opacity: 1, y: 0 }}
-          className="text-center space-y-8 max-w-md"
-        >
-          <div className="relative inline-block">
-            <div className="absolute -inset-4 bg-emerald-500/20 blur-2xl rounded-full" />
-            <Sparkles className="w-20 h-20 text-emerald-500 relative" />
-          </div>
-          <h1 className="text-6xl font-black tracking-tighter uppercase italic">
-            Shubhjeet AI
-          </h1>
-          <p className="text-zinc-400 text-lg font-medium leading-relaxed">
-            Your intelligent companion for creative chat and instant image generation.
-          </p>
-          <button
-            onClick={signIn}
-            className="w-full py-4 bg-white text-black font-bold rounded-2xl hover:bg-emerald-500 hover:text-white transition-all duration-300 flex items-center justify-center gap-3 group"
-          >
-            <UserIcon className="w-5 h-5 group-hover:scale-110 transition-transform" />
-            Sign in with Google
-          </button>
-        </motion.div>
-      </div>
-    );
-  }
+  if (loading) return <div className="h-screen flex items-center justify-center">Loading...</div>;
 
   return (
-    <div className="flex h-screen bg-[#0A0A0A] text-zinc-100 overflow-hidden font-sans">
-      {/* Sidebar */}
-      <AnimatePresence mode="wait">
-        {isSidebarOpen && (
-          <motion.aside
-            initial={{ x: -300, opacity: 0 }}
-            animate={{ x: 0, opacity: 1 }}
-            exit={{ x: -300, opacity: 0 }}
-            className="fixed inset-y-0 left-0 z-50 w-72 bg-[#111111] border-r border-white/5 flex flex-col md:relative"
-          >
-            <div className="p-4 flex items-center justify-between">
-              <h2 className="text-xl font-black tracking-tighter uppercase italic text-emerald-500">
-                Shubhjeet
-              </h2>
-              <button onClick={() => setIsSidebarOpen(false)} className="md:hidden">
-                <X className="w-6 h-6" />
-              </button>
-            </div>
+    <div className="min-h-screen bg-gray-50 font-sans text-gray-900">
+      <Navbar user={user} role={userProfile?.role || null} onLogout={() => signOut(auth)} />
 
-            <button
-              onClick={createNewSession}
-              className="mx-4 mb-4 p-3 bg-white/5 border border-white/10 rounded-xl flex items-center gap-3 hover:bg-white/10 transition-colors"
+      <main className="max-w-7xl mx-auto p-4 md:p-8">
+        <AnimatePresence mode="wait">
+          {view === 'home' && (
+            <motion.div 
+              key="home"
+              initial={{ opacity: 0 }} animate={{ opacity: 1 }} exit={{ opacity: 0 }}
+              className="text-center py-20"
             >
-              <Plus className="w-5 h-5" />
-              <span className="font-semibold text-sm">New Chat</span>
-            </button>
-
-            <div className="flex-1 overflow-y-auto px-2 space-y-1">
-              {sessions.map((s) => (
-                <button
-                  key={s.id}
-                  onClick={() => {
-                    setCurrentSessionId(s.id);
-                    if (window.innerWidth < 768) setIsSidebarOpen(false);
-                  }}
-                  className={cn(
-                    "w-full p-3 rounded-xl flex items-center gap-3 text-left transition-all group",
-                    currentSessionId === s.id ? "bg-emerald-500/10 text-emerald-500" : "hover:bg-white/5 text-zinc-400"
-                  )}
-                >
-                  <MessageSquare className="w-4 h-4 shrink-0" />
-                  <span className="text-sm font-medium truncate">{s.title}</span>
-                </button>
-              ))}
-            </div>
-
-            <div className="p-4 border-t border-white/5 space-y-2">
-              <button
-                onClick={() => setIsProfileModalOpen(true)}
-                className="w-full p-2 text-zinc-400 hover:text-emerald-500 flex items-center gap-2 text-sm transition-colors"
-              >
-                <Settings className="w-4 h-4" />
-                Personalize AI
-              </button>
-              <div className="flex items-center gap-3 p-2">
-                <img src={user.photoURL || ''} className="w-8 h-8 rounded-full" alt="" />
-                <div className="flex-1 truncate">
-                  <p className="text-sm font-bold truncate">{user.displayName}</p>
-                </div>
-              </div>
-              <button
-                onClick={logOut}
-                className="w-full p-2 text-zinc-500 hover:text-red-400 flex items-center gap-2 text-sm transition-colors"
-              >
-                <LogOut className="w-4 h-4" />
-                Logout
-              </button>
-            </div>
-          </motion.aside>
-        )}
-      </AnimatePresence>
-
-      {/* Key Selection Modal */}
-      {isKeySelectionNeeded && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-sm">
-          <div className="bg-[#1A1A1A] border border-white/10 rounded-3xl p-8 w-full max-w-md animate-in zoom-in-95">
-            <div className="flex items-center gap-3 mb-6">
-              <div className="w-12 h-12 bg-amber-500/20 rounded-2xl flex items-center justify-center">
-                <ShieldAlert className="w-6 h-6 text-amber-500" />
-              </div>
-              <div>
-                <h3 className="text-xl font-bold">API Key Required</h3>
-                <p className="text-sm text-zinc-500">Video generation requires a paid API key.</p>
-              </div>
-            </div>
-            <p className="text-sm text-zinc-400 mb-6 leading-relaxed">
-              To generate videos, you need to select a paid Google Cloud project API key. 
-              Please visit <a href="https://ai.google.dev/gemini-api/docs/billing" target="_blank" className="text-emerald-500 hover:underline">billing documentation</a> for more info.
-            </p>
-            <div className="flex gap-3">
-              <button
-                onClick={() => setIsKeySelectionNeeded(false)}
-                className="flex-1 p-4 bg-white/5 hover:bg-white/10 rounded-xl font-bold transition-all"
-              >
-                Cancel
-              </button>
-              <button
-                onClick={async () => {
-                  if (window.aistudio) {
-                    await window.aistudio.openSelectKey();
-                    setIsKeySelectionNeeded(false);
-                    handleSend(); // Retry sending
-                  }
-                }}
-                className="flex-1 p-4 bg-emerald-500 hover:bg-emerald-600 text-black rounded-xl font-bold transition-all"
-              >
-                Select Key
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* Focus Topic Modal */}
-      {isFocusTopicModalOpen && (
-        <div className="fixed inset-0 z-50 flex items-center justify-center p-4 bg-black/80 backdrop-blur-sm">
-          <div className="bg-[#1A1A1A] border border-white/10 rounded-3xl p-8 w-full max-w-md animate-in zoom-in-95">
-            <div className="flex items-center gap-3 mb-6">
-              <div className="w-12 h-12 bg-emerald-500/20 rounded-2xl flex items-center justify-center">
-                <Target className="w-6 h-6 text-emerald-500" />
-              </div>
-              <div>
-                <h3 className="text-xl font-bold">Focus Mode</h3>
-                <p className="text-sm text-zinc-500">What should we focus on?</p>
-              </div>
-            </div>
-            <input
-              type="text"
-              placeholder="e.g., Education, Coding, Fitness..."
-              className="w-full bg-white/5 border border-white/10 rounded-xl p-4 mb-6 focus:outline-none focus:border-emerald-500 transition-all"
-              onKeyDown={(e) => {
-                if (e.key === 'Enter') {
-                  handleSetFocusTopic((e.target as HTMLInputElement).value);
-                }
-              }}
-              autoFocus
-            />
-            <div className="flex gap-3">
-              <button
-                onClick={() => {
-                  setIsFocusTopicModalOpen(false);
-                  setFocusMode(false);
-                }}
-                className="flex-1 p-4 bg-white/5 hover:bg-white/10 rounded-xl font-bold transition-all"
-              >
-                Cancel
-              </button>
-              <button
-                onClick={() => {
-                  const input = document.querySelector('input[placeholder="e.g., Education, Coding, Fitness..."]') as HTMLInputElement;
-                  if (input.value) handleSetFocusTopic(input.value);
-                }}
-                className="flex-1 p-4 bg-emerald-500 hover:bg-emerald-600 text-black rounded-xl font-bold transition-all"
-              >
-                Start Focus
-              </button>
-            </div>
-          </div>
-        </div>
-      )}
-
-      {/* Profile Modal */}
-      <AnimatePresence>
-        {isProfileModalOpen && (
-          <div className="fixed inset-0 z-[100] flex items-center justify-center p-4 bg-black/80 backdrop-blur-sm">
-            <motion.div
-              initial={{ scale: 0.9, opacity: 0 }}
-              animate={{ scale: 1, opacity: 1 }}
-              exit={{ scale: 0.9, opacity: 0 }}
-              className="bg-[#111111] border border-white/10 rounded-3xl p-8 max-w-lg w-full space-y-6"
-            >
-              <div className="flex items-center justify-between">
-                <h2 className="text-2xl font-black tracking-tighter uppercase italic text-emerald-500">
-                  Personalize Shubhjeet AI
-                </h2>
-                <button onClick={() => setIsProfileModalOpen(false)}>
-                  <X className="w-6 h-6" />
-                </button>
-              </div>
-              <p className="text-zinc-400 text-sm">
-                Tell me about yourself so I can provide better, more personalized responses.
+              <h1 className="text-5xl font-extrabold text-indigo-900 mb-6">Teacher Management Portal</h1>
+              <p className="text-xl text-gray-600 max-w-2xl mx-auto mb-12">
+                Welcome to S.S.M Sr. Sec. School's official management portal. 
+                Streamlining attendance, leaves, and scheduling for our dedicated educators.
               </p>
-              <div className="space-y-4">
-                <div className="space-y-2">
-                  <label className="text-xs font-bold uppercase tracking-widest text-zinc-500">Your Role</label>
-                  <input
-                    type="text"
-                    placeholder="e.g. Coder, Student, Educator"
-                    value={userProfile.role}
-                    onChange={(e) => setUserProfile({ ...userProfile, role: e.target.value })}
-                    className="w-full bg-[#1A1A1A] border border-white/10 rounded-xl p-3 focus:border-emerald-500/50 outline-none text-sm"
-                  />
-                </div>
-                <div className="space-y-2">
-                  <label className="text-xs font-bold uppercase tracking-widest text-zinc-500">Interests</label>
-                  <input
-                    type="text"
-                    placeholder="e.g. AI, Space, Cooking, Gaming"
-                    value={userProfile.interests}
-                    onChange={(e) => setUserProfile({ ...userProfile, interests: e.target.value })}
-                    className="w-full bg-[#1A1A1A] border border-white/10 rounded-xl p-3 focus:border-emerald-500/50 outline-none text-sm"
-                  />
-                </div>
-                <div className="space-y-2">
-                  <label className="text-xs font-bold uppercase tracking-widest text-zinc-500">Short Bio</label>
-                  <textarea
-                    placeholder="Tell me a bit more about what you do..."
-                    value={userProfile.bio}
-                    onChange={(e) => setUserProfile({ ...userProfile, bio: e.target.value })}
-                    className="w-full bg-[#1A1A1A] border border-white/10 rounded-xl p-3 focus:border-emerald-500/50 outline-none text-sm min-h-[100px] resize-none"
-                  />
-                </div>
-              </div>
-              <button
-                onClick={saveProfile}
-                className="w-full py-4 bg-emerald-500 text-white font-bold rounded-2xl hover:bg-emerald-400 transition-all flex items-center justify-center gap-2"
-              >
-                <Save className="w-5 h-5" />
-                Save Personalization
-              </button>
-            </motion.div>
-          </div>
-        )}
-      </AnimatePresence>
-
-      {/* Main Content */}
-      <main className="flex-1 flex flex-col relative min-w-0">
-        {/* Header */}
-        <header className="h-16 border-bottom border-white/5 flex items-center px-4 gap-4 bg-[#0A0A0A]/80 backdrop-blur-md sticky top-0 z-40">
-          <button
-            onClick={() => setIsSidebarOpen(true)}
-            className={cn("p-2 hover:bg-white/5 rounded-lg", isSidebarOpen && "hidden")}
-          >
-            <Menu className="w-6 h-6" />
-          </button>
-          <div className="flex-1">
-            <h1 className="text-sm font-bold text-zinc-400 uppercase tracking-widest">
-              {currentSessionId ? sessions.find(s => s.id === currentSessionId)?.title : 'New Conversation'}
-            </h1>
-          </div>
-        </header>
-
-        {/* Messages */}
-        <div className="flex-1 overflow-y-auto p-4 md:p-8 space-y-8">
-          {messages.length === 0 && !isLoading && (
-            <div className="h-full flex flex-col items-center justify-center text-center space-y-4 opacity-20">
-              <Bot className="w-16 h-16" />
-              <p className="text-xl font-medium">How can I help you today?</p>
-            </div>
-          )}
-          
-          {messages.map((m) => (
-            <motion.div
-              initial={{ opacity: 0, y: 10 }}
-              animate={{ opacity: 1, y: 0 }}
-              key={m.id}
-              className={cn(
-                "flex gap-4 max-w-3xl mx-auto",
-                m.role === 'user' ? "flex-row-reverse" : "flex-row"
-              )}
-            >
-              <div className={cn(
-                "w-8 h-8 rounded-lg flex items-center justify-center shrink-0",
-                m.role === 'user' ? "bg-emerald-500" : "bg-zinc-800"
-              )}>
-                {m.role === 'user' ? <UserIcon className="w-5 h-5" /> : <Bot className="w-5 h-5" />}
-              </div>
-              <div className={cn(
-                "flex-1 space-y-2",
-                m.role === 'user' ? "text-right" : "text-left"
-              )}>
-                <div className={cn(
-                  "inline-block p-4 rounded-2xl text-sm leading-relaxed",
-                  m.role === 'user' ? "bg-emerald-500/10 text-emerald-50" : "bg-zinc-900 text-zinc-300"
-                )}>
-                  {m.type === 'image' ? (
-                    <div className="space-y-4">
-                      <div className="flex items-center justify-between gap-4 mb-2">
-                        <p className="text-xs text-zinc-500 italic">{m.content}</p>
-                        <button
-                          onClick={() => downloadImage(m.imageUrl!, `shubhjeet-ai-${Date.now()}.png`)}
-                          className="p-1.5 bg-white/5 hover:bg-white/10 rounded-lg text-zinc-400 hover:text-emerald-500 transition-all"
-                          title="Download Image"
-                        >
-                          <Download className="w-4 h-4" />
-                        </button>
-                      </div>
-                      <img 
-                        src={m.imageUrl} 
-                        className="rounded-xl w-full max-w-md border border-white/10" 
-                        alt="Generated"
-                        referrerPolicy="no-referrer"
-                      />
-                    </div>
-                  ) : m.type === 'video' ? (
-                    <div className="space-y-4">
-                      <div className="flex items-center justify-between gap-4 mb-2">
-                        <p className="text-xs text-zinc-500 italic">{m.content}</p>
-                      </div>
-                      <video 
-                        src={m.videoUrl} 
-                        controls 
-                        className="rounded-xl w-full max-w-md border border-white/10"
-                      />
-                    </div>
-                  ) : m.type === 'pdf' ? (
-                    <div className="space-y-4">
-                      <div className="flex items-center gap-3 p-4 bg-white/5 rounded-xl border border-white/10">
-                        <div className="w-12 h-12 bg-red-500/20 rounded-lg flex items-center justify-center">
-                          <FileText className="w-6 h-6 text-red-500" />
-                        </div>
-                        <div className="flex-1 min-w-0">
-                          <p className="text-sm font-bold truncate">{m.fileName}</p>
-                          <p className="text-xs text-zinc-500">PDF Document Generated</p>
-                        </div>
-                        <a 
-                          href={m.pdfUrl} 
-                          download={m.fileName}
-                          className="p-2 bg-white/5 hover:bg-white/10 rounded-lg text-zinc-400 hover:text-emerald-500 transition-all"
-                        >
-                          <Download className="w-5 h-5" />
-                        </a>
-                      </div>
-                      <p className="text-sm text-zinc-400">{m.content}</p>
-                    </div>
-                  ) : m.type === 'file' ? (
-                    <div className="space-y-2">
-                      <div className="flex items-center gap-3 p-3 bg-white/5 rounded-xl border border-white/10">
-                        <div className="w-10 h-10 bg-emerald-500/20 rounded-lg flex items-center justify-center">
-                          <Plus className="w-5 h-5 text-emerald-500" />
-                        </div>
-                        <div className="flex-1 min-w-0">
-                          <p className="text-sm font-bold truncate">{m.fileName}</p>
-                          <p className="text-[10px] text-zinc-500 uppercase tracking-widest">{m.fileMimeType}</p>
-                        </div>
-                      </div>
-                      <div className="prose prose-invert prose-sm max-w-none">
-                        <ReactMarkdown>{m.content}</ReactMarkdown>
-                      </div>
-                    </div>
-                  ) : (
-                    <div className="relative group/msg">
-                      <div className="prose prose-invert prose-sm max-w-none">
-                        <ReactMarkdown>{m.content}</ReactMarkdown>
-                      </div>
-                      {m.role === 'model' && (
-                        <button
-                          onClick={() => handlePlayAudio(m)}
-                          className="absolute -right-12 top-0 p-2 text-zinc-500 hover:text-emerald-500 transition-colors opacity-0 group-hover/msg:opacity-100"
-                        >
-                          {playingAudioId === m.id ? <VolumeX className="w-4 h-4" /> : <Volume2 className="w-4 h-4" />}
-                        </button>
-                      )}
-                    </div>
-                  )}
-                </div>
-              </div>
-            </motion.div>
-          ))}
-          {isLoading && (
-            <div className="flex gap-4 max-w-3xl mx-auto">
-              <div className="w-8 h-8 rounded-lg bg-zinc-800 flex items-center justify-center animate-pulse">
-                <Bot className="w-5 h-5" />
-              </div>
-              <div className="flex-1">
-                <div className="inline-block p-4 rounded-2xl bg-zinc-900">
-                  <Loader2 className="w-5 h-5 animate-spin text-emerald-500" />
-                </div>
-              </div>
-            </div>
-          )}
-          <div ref={messagesEndRef} />
-        </div>
-
-        {/* Input */}
-        <div className="p-4 md:p-8 bg-gradient-to-t from-[#0A0A0A] via-[#0A0A0A] to-transparent">
-          <div className="max-w-3xl mx-auto mb-4 flex items-center justify-between px-2">
-            <div className="flex items-center gap-4">
-              <div className="flex items-center gap-2">
-                <button
-                  onClick={handleToggleFocusMode}
-                  className={`relative inline-flex h-6 w-11 items-center rounded-full transition-colors focus:outline-none ${focusMode ? 'bg-emerald-500' : 'bg-zinc-700'}`}
-                >
-                  <span className={`inline-block h-4 w-4 transform rounded-full bg-white transition-transform ${focusMode ? 'translate-x-6' : 'translate-x-1'}`} />
-                </button>
-                <span className={`text-xs font-medium ${focusMode ? 'text-emerald-500' : 'text-zinc-500'}`}>
-                  Focus Mode {focusMode ? `(${focusTopic})` : 'Off'}
-                </span>
-              </div>
-            </div>
-            <div className="text-[10px] text-zinc-600 font-medium uppercase tracking-widest flex items-center gap-1.5">
-              <ShieldAlert className="w-3 h-3" />
-              Shubhjeet AI can make mistakes
-            </div>
-          </div>
-          
-          {selectedFile && (
-            <div className="max-w-3xl mx-auto mb-4 flex items-center gap-3 p-3 bg-[#1A1A1A] border border-emerald-500/30 rounded-2xl animate-in fade-in slide-in-from-bottom-2">
-              <div className="w-10 h-10 bg-emerald-500/20 rounded-lg flex items-center justify-center">
-                <Plus className="w-5 h-5 text-emerald-500" />
-              </div>
-              <div className="flex-1 min-w-0">
-                <p className="text-sm font-bold truncate">{selectedFile.name}</p>
-                <p className="text-[10px] text-zinc-500 uppercase tracking-widest">{selectedFile.mimeType}</p>
-              </div>
               <button 
-                onClick={() => setSelectedFile(null)}
-                className="p-2 hover:bg-white/5 rounded-full text-zinc-500 hover:text-red-400 transition-colors"
+                onClick={() => setView('login-selection')}
+                className="bg-indigo-600 text-white px-12 py-4 rounded-full text-lg font-bold shadow-xl hover:bg-indigo-700 transition-all transform hover:scale-105"
               >
-                <X className="w-4 h-4" />
+                Get Started
               </button>
-            </div>
+            </motion.div>
           )}
-          <form 
-            onSubmit={(e) => handleSend(e)}
-            className="max-w-3xl mx-auto relative group"
-          >
-            <input 
-              type="file"
-              ref={fileInputRef}
-              onChange={handleFileSelect}
-              className="hidden"
-              accept="image/*,application/pdf,text/*"
-            />
-            <textarea
-              value={input}
-              onChange={(e) => setInput(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === 'Enter' && !e.shiftKey) {
-                  e.preventDefault();
-                  handleSend();
-                }
-              }}
-              placeholder="Ask Shubhjeet AI anything..."
-              className="w-full bg-[#1A1A1A] border border-white/10 rounded-2xl p-4 pl-14 pr-32 min-h-[60px] max-h-48 resize-none focus:outline-none focus:border-emerald-500/50 transition-all text-sm"
-              rows={1}
-            />
-            <div className="absolute left-2 bottom-2">
-              <button
-                type="button"
-                onClick={() => fileInputRef.current?.click()}
-                className="p-2 text-zinc-500 hover:text-emerald-500 transition-colors"
-                title="Upload File"
-              >
-                <Plus className="w-6 h-6" />
-              </button>
-            </div>
-            <div className="absolute right-2 bottom-2 flex gap-2">
-              <button
-                type="button"
-                onClick={() => handleSend(undefined, 'image')}
-                disabled={isLoading || !input.trim()}
-                className="p-2 text-zinc-500 hover:text-emerald-500 disabled:opacity-50 transition-colors"
-                title="Generate Image"
-              >
-                <ImageIcon className="w-5 h-5" />
-              </button>
-              <button
-                type="submit"
-                disabled={isLoading || !input.trim()}
-                className="p-2 bg-emerald-500 text-white rounded-xl hover:bg-emerald-400 disabled:opacity-50 transition-all"
-              >
-                <Send className="w-5 h-5" />
-              </button>
-            </div>
-          </form>
-          <p className="text-center text-[10px] text-zinc-600 mt-4 uppercase tracking-[0.2em]">
-            Shubhjeet AI v1.1 • Created by Shubhjeet
-          </p>
-        </div>
+
+          {view === 'login-selection' && (
+            <motion.div 
+              key="selection"
+              initial={{ opacity: 0, scale: 0.95 }} animate={{ opacity: 1, scale: 1 }}
+              className="grid md:grid-cols-2 gap-8 max-w-4xl mx-auto mt-12"
+            >
+              <Card title="Teacher Portal" icon={Users}>
+                <p className="text-gray-500 mb-6">Login with your Teacher ID and Password to access your dashboard.</p>
+                <button 
+                  onClick={() => setView('teacher-login')}
+                  className="w-full py-3 bg-white border-2 border-indigo-600 text-indigo-600 font-bold rounded-xl hover:bg-indigo-50 transition-colors flex items-center justify-center gap-2"
+                >
+                  Teacher Login
+                </button>
+              </Card>
+              <Card title="Admin Portal" icon={ShieldCheck}>
+                <div className="space-y-4">
+                  <input 
+                    type="text" placeholder="Admin ID" 
+                    className="w-full p-3 border rounded-xl"
+                    value={adminLogin.id} onChange={e => setAdminLogin({...adminLogin, id: e.target.value})}
+                  />
+                  <input 
+                    type="password" placeholder="Password" 
+                    className="w-full p-3 border rounded-xl"
+                    value={adminLogin.pass} onChange={e => setAdminLogin({...adminLogin, pass: e.target.value})}
+                  />
+                  <button 
+                    onClick={handleAdminLogin}
+                    className="w-full py-3 bg-indigo-600 text-white font-bold rounded-xl hover:bg-indigo-700 transition-colors"
+                  >
+                    Admin Access
+                  </button>
+                  {error && <p className="text-red-500 text-sm flex items-center gap-1"><AlertCircle className="w-4 h-4" /> {error}</p>}
+                </div>
+              </Card>
+            </motion.div>
+          )}
+
+          {view === 'teacher-login' && (
+            <motion.div key="teacher-login" className="max-w-md mx-auto mt-12">
+              <Card title="Teacher Login" icon={Users}>
+                <div className="space-y-4">
+                  <input 
+                    type="text" placeholder="Teacher ID" className="w-full p-3 border rounded-xl"
+                    value={teacherAuth.id} onChange={e => setTeacherAuth({...teacherAuth, id: e.target.value})}
+                  />
+                  <input 
+                    type="password" placeholder="Password" className="w-full p-3 border rounded-xl"
+                    value={teacherAuth.pass} onChange={e => setTeacherAuth({...teacherAuth, pass: e.target.value})}
+                  />
+                  <button 
+                    onClick={handleTeacherLogin}
+                    className="w-full py-3 bg-indigo-600 text-white font-bold rounded-xl hover:bg-indigo-700"
+                  >
+                    Login
+                  </button>
+                  <div className="text-center">
+                    <button 
+                      onClick={() => setView('teacher-signup')}
+                      className="text-indigo-600 text-sm font-medium hover:underline"
+                    >
+                      New User? Sign In
+                    </button>
+                  </div>
+                  {error && <p className="text-red-500 text-sm flex items-center gap-1"><AlertCircle className="w-4 h-4" /> {error}</p>}
+                </div>
+              </Card>
+            </motion.div>
+          )}
+
+          {view === 'teacher-signup' && (
+            <motion.div key="teacher-signup" className="max-w-md mx-auto mt-12">
+              <Card title="Teacher Registration" icon={UserPlus}>
+                <div className="space-y-4">
+                  <input 
+                    type="text" placeholder="Full Name" className="w-full p-3 border rounded-xl"
+                    value={signupForm.name} onChange={e => setSignupForm({...signupForm, name: e.target.value})}
+                  />
+                  <input 
+                    type="text" placeholder="Mobile Number" className="w-full p-3 border rounded-xl"
+                    value={signupForm.mobile} onChange={e => setSignupForm({...signupForm, mobile: e.target.value})}
+                  />
+                  <input 
+                    type="text" placeholder="Desired Teacher ID" className="w-full p-3 border rounded-xl"
+                    value={signupForm.id} onChange={e => setSignupForm({...signupForm, id: e.target.value})}
+                  />
+                  <input 
+                    type="password" placeholder="Password" className="w-full p-3 border rounded-xl"
+                    value={signupForm.pass} onChange={e => setSignupForm({...signupForm, pass: e.target.value})}
+                  />
+                  <div className="grid grid-cols-2 gap-4">
+                    <select 
+                      className="w-full p-3 border rounded-xl"
+                      value={signupForm.classLevel} onChange={e => setSignupForm({...signupForm, classLevel: e.target.value})}
+                    >
+                      <option value="">Select Class</option>
+                      {[6,7,8,9,10,11,12].map(n => <option key={n} value={n}>Class {n}</option>)}
+                    </select>
+                    <input 
+                      type="text" placeholder="Subject" className="w-full p-3 border rounded-xl"
+                      value={signupForm.subject} onChange={e => setSignupForm({...signupForm, subject: e.target.value})}
+                    />
+                  </div>
+                  <button 
+                    onClick={handleTeacherSignup}
+                    className="w-full py-3 bg-indigo-600 text-white font-bold rounded-xl hover:bg-indigo-700"
+                  >
+                    Create Account
+                  </button>
+                  <div className="text-center">
+                    <button 
+                      onClick={() => setView('teacher-login')}
+                      className="text-indigo-600 text-sm font-medium hover:underline"
+                    >
+                      Already have an account? Login
+                    </button>
+                  </div>
+                  {error && <p className="text-red-500 text-sm flex items-center gap-1"><AlertCircle className="w-4 h-4" /> {error}</p>}
+                </div>
+              </Card>
+            </motion.div>
+          )}
+
+          {view === 'teacher-portal' && (
+            <motion.div key="teacher" className="grid md:grid-cols-3 gap-8">
+              <Card title="Attendance" icon={ClipboardCheck}>
+                <div className="space-y-4">
+                  <p className="text-sm text-gray-500">Enter the 6-digit code provided by the administrator.</p>
+                  <input 
+                    type="text" maxLength={6} placeholder="000000"
+                    className="w-full p-4 text-center text-3xl font-mono tracking-widest border-2 border-indigo-100 rounded-2xl focus:border-indigo-600 outline-none"
+                    onChange={(e) => { if(e.target.value.length === 6) markAttendance(e.target.value); }}
+                  />
+                  <button 
+                    onClick={() => exportToExcel(attendance.filter(a => a.teacherId === user?.uid), 'My_Attendance')}
+                    className="w-full flex items-center justify-center gap-2 text-indigo-600 font-medium py-2 hover:bg-indigo-50 rounded-lg"
+                  >
+                    <Download className="w-4 h-4" /> Download History
+                  </button>
+                </div>
+              </Card>
+
+              <Card title="Leave Application" icon={FileText}>
+                <div className="space-y-3">
+                  <div className="grid grid-cols-2 gap-2">
+                    <input type="date" className="p-2 border rounded-lg text-sm" value={leaveForm.startDate} onChange={e => setLeaveForm({...leaveForm, startDate: e.target.value})} />
+                    <input type="date" className="p-2 border rounded-lg text-sm" value={leaveForm.endDate} onChange={e => setLeaveForm({...leaveForm, endDate: e.target.value})} />
+                  </div>
+                  <textarea 
+                    placeholder="Reason for leave" className="w-full p-2 border rounded-lg text-sm h-20"
+                    value={leaveForm.reason} onChange={e => setLeaveForm({...leaveForm, reason: e.target.value})}
+                  />
+                  <input type="text" placeholder="Mobile" className="w-full p-2 border rounded-lg text-sm" value={leaveForm.mobile} onChange={e => setLeaveForm({...leaveForm, mobile: e.target.value})} />
+                  <button onClick={submitLeave} className="w-full py-2 bg-indigo-600 text-white rounded-lg font-bold">Submit</button>
+                </div>
+              </Card>
+
+              <Card title="Time Table" icon={Clock}>
+                <div className="space-y-4">
+                  <div className="p-4 bg-gray-50 rounded-xl border border-dashed border-gray-300 text-center">
+                    <p className="text-gray-500 text-sm">Your weekly schedule will appear here.</p>
+                  </div>
+                </div>
+              </Card>
+            </motion.div>
+          )}
+
+          {view === 'admin-portal' && (
+            <motion.div key="admin" className="space-y-8">
+              <div className="grid md:grid-cols-4 gap-6">
+                <div className="bg-white p-6 rounded-2xl shadow-sm border border-indigo-100">
+                  <p className="text-gray-500 text-sm mb-1">Active Code</p>
+                  <h2 className="text-3xl font-mono font-bold text-indigo-600">{attendanceCode || '------'}</h2>
+                  <button onClick={generateCode} className="mt-4 text-sm font-bold text-indigo-600 hover:underline flex items-center gap-1">
+                    <Plus className="w-4 h-4" /> Generate New
+                  </button>
+                </div>
+                <div className="bg-white p-6 rounded-2xl shadow-sm border border-gray-100">
+                  <p className="text-gray-500 text-sm mb-1">Pending Leaves</p>
+                  <h2 className="text-3xl font-bold text-gray-800">{leaves.filter(l => l.status === 'pending').length}</h2>
+                </div>
+                <div className="bg-white p-6 rounded-2xl shadow-sm border border-gray-100">
+                  <p className="text-gray-500 text-sm mb-1">Today's Attendance</p>
+                  <h2 className="text-3xl font-bold text-gray-800">{attendance.filter(a => a.date === format(new Date(), 'yyyy-MM-dd')).length}</h2>
+                </div>
+                <div className="bg-white p-6 rounded-2xl shadow-sm border border-gray-100">
+                  <button 
+                    onClick={() => exportToExcel(attendance, 'School_Attendance_Report')}
+                    className="w-full h-full flex flex-col items-center justify-center gap-2 text-indigo-600 font-bold"
+                  >
+                    <Download className="w-8 h-8" />
+                    Export Report
+                  </button>
+                </div>
+              </div>
+
+              <div className="grid md:grid-cols-2 gap-8">
+                <Card title="Leave Requests" icon={FileText}>
+                  <div className="space-y-4 max-h-96 overflow-y-auto pr-2">
+                    {leaves.map(leave => (
+                      <div key={leave.id} className="p-4 bg-gray-50 rounded-xl flex justify-between items-center">
+                        <div>
+                          <p className="font-bold">{leave.teacherName}</p>
+                          <p className="text-xs text-gray-500">{leave.startDate} to {leave.endDate}</p>
+                          <p className="text-sm mt-1 italic">"{leave.reason}"</p>
+                        </div>
+                        <div className="flex gap-2">
+                          <button className="p-2 bg-green-100 text-green-600 rounded-lg hover:bg-green-200"><ClipboardCheck className="w-4 h-4" /></button>
+                          <button className="p-2 bg-red-100 text-red-600 rounded-lg hover:bg-red-200"><X className="w-4 h-4" /></button>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                </Card>
+
+                <Card title="Time Table Management" icon={Calendar}>
+                  <div className="space-y-4">
+                    <button className="w-full py-4 bg-indigo-50 text-indigo-600 rounded-2xl border-2 border-indigo-100 border-dashed font-bold hover:bg-indigo-100 transition-all">
+                      AI Generate Time Table
+                    </button>
+                    <div className="grid grid-cols-2 gap-4">
+                      <button className="p-4 bg-white border rounded-xl text-sm font-medium hover:bg-gray-50">Manage Subjects</button>
+                      <button className="p-4 bg-white border rounded-xl text-sm font-medium hover:bg-gray-50">Teacher List</button>
+                    </div>
+                  </div>
+                </Card>
+              </div>
+            </motion.div>
+          )}
+        </AnimatePresence>
       </main>
     </div>
   );
