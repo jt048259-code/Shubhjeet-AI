@@ -59,5 +59,10 @@ service cloud.firestore {
       allow read: if isAuthenticated();
       allow write: if isAdmin();
     }
+
+    match /settings/school {
+      allow read: if true;
+      allow write: if isAdmin();
+    }
   }
 }

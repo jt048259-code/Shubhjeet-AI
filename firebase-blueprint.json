@@ -10,7 +10,7 @@
         "email": { "type": "string" },
         "role": { "type": "string", "enum": ["teacher", "admin"] },
         "mobile": { "type": "string" },
-        "classLevel": { "type": "string" },
+        "classes": { "type": "array", "items": { "type": "string" } },
         "subjects": { "type": "array", "items": { "type": "string" } },
         "createdAt": { "type": "string", "format": "date-time" }
       },
@@ -87,6 +87,9 @@
     "/timetable/{tableId}": {
       "schema": "TimeTable",
       "description": "Time table records"
+    },
+    "/settings/school": {
+      "description": "Global school settings like subjects and classes"
     }
   }
 }
