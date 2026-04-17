@@ -4,6 +4,7 @@ const ai = new GoogleGenAI({ apiKey: process.env.GEMINI_API_KEY });
 
 export interface TimetableEntry {
   class: string;
+  section: string;
   subject: string;
   teacherName: string;
   teacherId: string;
@@ -13,6 +14,7 @@ export interface TimetableEntry {
 
 export interface SubjectRequirement {
   class: string;
+  section: string;
   subject: string;
   frequencyPerWeek: number;
 }
@@ -27,24 +29,25 @@ export const generateTimetableAI = async (
     Teachers:
     ${JSON.stringify(teachers, null, 2)}
     
-    Subject Requirements per Class:
+    Subject Requirements per Class Section:
     ${JSON.stringify(requirements, null, 2)}
     
     Constraints:
-    1. Max 6 bells per teacher per day.
+    1. Max 6 bells per teacher per day (IMPORTANT).
     2. A teacher can only teach their assigned subjects and classes.
-    3. No two classes can have the same teacher at the same time (bell).
-    4. Each class should have 6 bells per day.
+    3. No two class-sections can have the same teacher at the same time (bell).
+    4. Each class-section must have 8 bells per day.
     5. Try to distribute subjects evenly across the week.
     
     Return the result as a JSON array of objects with the following structure:
     {
       "class": "string",
+      "section": "string",
       "subject": "string",
       "teacherName": "string",
       "teacherId": "string",
-      "day": "string (Monday, Tuesday, etc.)",
-      "bell": number (1-6)
+      "day": "string (Monday-Saturday)",
+      "bell": number (1-8)
     }
   `;
 
@@ -59,13 +62,14 @@ export const generateTimetableAI = async (
           type: Type.OBJECT,
           properties: {
             class: { type: Type.STRING },
+            section: { type: Type.STRING },
             subject: { type: Type.STRING },
             teacherName: { type: Type.STRING },
             teacherId: { type: Type.STRING },
             day: { type: Type.STRING },
             bell: { type: Type.NUMBER }
           },
-          required: ["class", "subject", "teacherName", "teacherId", "day", "bell"]
+          required: ["class", "section", "subject", "teacherName", "teacherId", "day", "bell"]
         }
       }
     }
