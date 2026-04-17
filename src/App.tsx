@@ -1,11 +1,14 @@
-import React, { useState, useEffect, useMemo } from 'react';
+import React, { useState, useEffect } from 'react';
+import * as XLSX from 'xlsx';
+
+// --- Types ---
 import { 
   Users, Calendar, Clock, Download, Plus, X, Search, 
   Menu, LogOut, LayoutDashboard, UserCheck, UserX, 
-  FileText, Sparkles, ChevronLeft, ChevronRight, 
+  FileText, Sparkles, ChevronLeft, ChevronRight, History,
   Settings, ShieldCheck, Mail, Lock, Phone, UserPlus,
   CalendarCheck, AlertCircle, Trash2, Save, Filter,
-  CheckCircle2, Info, ArrowUpRight, GraduationCap
+  CheckCircle2, Info, ArrowUpRight, GraduationCap, HelpCircle
 } from 'lucide-react';
 import { 
   initializeApp 
@@ -22,20 +25,127 @@ import {
 import { 
   format, startOfMonth, endOfMonth, eachDayOfInterval, 
   isPast, isToday, addMonths, subMonths, getDay, 
-  parseISO, isAfter, startOfDay, endOfDay, addDays, subDays
+  parseISO, isAfter, startOfDay, endOfDay, addDays, subDays,
+  isSameMonth, startOfYear
 } from 'date-fns';
-import * as XLSX from 'xlsx';
 import { motion, AnimatePresence } from 'motion/react';
 import { generateTimetableAI, suggestSubstitutionAI, TimetableEntry, SubjectRequirement } from './services/geminiService';
 import firebaseConfig from '../firebase-applet-config.json';
 
 // --- Firebase Initialization ---
 const app = initializeApp(firebaseConfig);
-const db = getFirestore(app);
+const db = getFirestore(app, (firebaseConfig as any).firestoreDatabaseId);
 const auth = getAuth(app);
 const provider = new GoogleAuthProvider();
 
+// Connection test
+async function testConnection() {
+  try {
+    await getDocFromServer(doc(db, 'test', 'connection'));
+  } catch (error) {
+    if(error instanceof Error && error.message.includes('the client is offline')) {
+      console.error("Please check your Firebase configuration. The client is reporting as offline.");
+    }
+  }
+}
+testConnection();
+
 // --- Types ---
+enum OperationType {
+  CREATE = 'create',
+  UPDATE = 'update',
+  DELETE = 'delete',
+  LIST = 'list',
+  GET = 'get',
+  WRITE = 'write',
+}
+
+interface FirestoreErrorInfo {
+  error: string;
+  operationType: OperationType;
+  path: string | null;
+  authInfo: {
+    userId: string | undefined;
+    email: string | null | undefined;
+    emailVerified: boolean | undefined;
+    isAnonymous: boolean | undefined;
+    tenantId: string | null | undefined;
+    providerInfo: {
+      providerId: string;
+      displayName: string | null;
+      email: string | null;
+      photoUrl: string | null;
+    }[];
+  }
+}
+
+function handleFirestoreError(error: unknown, operationType: OperationType, path: string | null) {
+  const errInfo: FirestoreErrorInfo = {
+    error: error instanceof Error ? error.message : String(error),
+    authInfo: {
+      userId: auth.currentUser?.uid,
+      email: auth.currentUser?.email,
+      emailVerified: auth.currentUser?.emailVerified,
+      isAnonymous: auth.currentUser?.isAnonymous,
+      tenantId: auth.currentUser?.tenantId,
+      providerInfo: auth.currentUser?.providerData.map(provider => ({
+        providerId: provider.providerId,
+        displayName: provider.displayName,
+        email: provider.email,
+        photoUrl: provider.photoURL
+      })) || []
+    },
+    operationType,
+    path
+  }
+  console.error('Firestore Error: ', JSON.stringify(errInfo));
+  throw new Error(JSON.stringify(errInfo));
+}
+
+class ErrorBoundary extends React.Component<{ children: React.ReactNode }, { hasError: boolean, error: Error | null }> {
+  constructor(props: { children: React.ReactNode }) {
+    super(props);
+    this.state = { hasError: false, error: null };
+  }
+
+  static getDerivedStateFromError(error: Error) {
+    return { hasError: true, error };
+  }
+
+  render() {
+    if (this.state.hasError) {
+      let isFirestoreError = false;
+      let firestoreMsg = "";
+      try {
+        const parsed = JSON.parse(this.state.error?.message || "");
+        if (parsed.operationType) {
+          isFirestoreError = true;
+          firestoreMsg = `Firestore error during ${parsed.operationType} on ${parsed.path || 'unknown path'}.`;
+        }
+      } catch (e) {
+        // Not a JSON error
+      }
+
+      return (
+        <div className="min-h-screen bg-red-50 flex flex-col items-center justify-center p-6 text-center">
+          <AlertCircle className="w-16 h-16 text-red-600 mb-4" />
+          <h2 className="text-2xl font-black text-red-950 mb-2">Something went wrong</h2>
+          <p className="text-red-700 max-w-md mb-6">
+            {isFirestoreError ? firestoreMsg : "An unexpected error occurred. Please try refreshing the page."}
+          </p>
+          <button 
+            onClick={() => window.location.reload()}
+            className="bg-red-600 text-white px-8 py-3 rounded-2xl font-black shadow-xl shadow-red-200 hover:bg-red-700 transition-all"
+          >
+            REFRESH PORTAL
+          </button>
+        </div>
+      );
+    }
+    return this.props.children;
+  }
+}
+
 interface Teacher {
   uid: string;
   name: string;
@@ -68,27 +178,28 @@ interface LeaveRequest {
 
 interface Arrangement {
   id?: string;
-  date: string;
-  absentTeachers: {
-    teacherId: string;
-    teacherName: string;
-    substitutions: {
-      bell: number;
-      class: string;
-      substituteId: string;
-      substituteName: string;
-    }[];
+  date: string; // ISO Date YYYY-MM-DD
+  substitutions: {
+    absentTeacherId: string;
+    absentTeacherName: string;
+    period: number;
+    class: string;
+    subject: string;
+    substituteId: string | 'UNASSIGNED';
+    substituteName: string;
   }[];
+  createdAt: string;
 }
 
 interface StudentAttendance {
   id?: string;
-  class: string;
   date: string;
+  class: string;
   totalStudents: number;
   present: number;
   absent: number;
-  teacherName: string;
+  recordedBy: string; // Teacher UID
+  recordedByName: string;
 }
 
 interface Holiday {
@@ -211,7 +322,7 @@ const AttendanceGrid = ({ month, teachers, attendance, leaves, holidays }: {
 // --- Main App Component ---
 
 export default function App() {
-  const [view, setView] = useState<'home' | 'loginSelection' | 'teacherLogin' | 'adminLogin' | 'teacherPortal' | 'adminPortal'>('home');
+  const [view, setView] = useState<'home' | 'loginSelection' | 'teacherLogin' | 'adminLogin' | 'teacherPortal' | 'adminPortal' | 'teacherSignUp'>('home');
   const [user, setUser] = useState<any>(null);
   const [userProfile, setUserProfile] = useState<Teacher | null>(null);
   const [loading, setLoading] = useState(true);
@@ -227,13 +338,12 @@ export default function App() {
   const [schoolSettings, setSchoolSettings] = useState<SchoolSettings>({ subjects: [], classes: [] });
   const [subjectRequirements, setSubjectRequirements] = useState<SubjectRequirement[]>([]);
 
-  // UI States
-  const [activeAdminSection, setActiveAdminSection] = useState<'dashboard' | 'attendance' | 'arrangement' | 'teachers' | 'timetable'>('dashboard');
+  const [activeAdminSection, setActiveAdminSection] = useState<'dashboard' | 'attendance' | 'arrangement' | 'teachers' | 'timetable' | 'students'>('dashboard');
   const [activeArrangementTab, setActiveArrangementTab] = useState<'view' | 'generate' | 'leaves'>('generate');
+  const [arrangementDate, setArrangementDate] = useState<Date>(new Date());
   const [activeTimetableSubSection, setActiveTimetableSubSection] = useState<'view' | 'generate'>('view');
   const [timetableViewState, setTimetableViewState] = useState<'teacher' | 'class'>('teacher');
   const [activeTimetableView, setActiveTimetableView] = useState<'teacher' | 'class'>('teacher');
-  const [arrangementDate, setArrangementDate] = useState<Date>(new Date());
   const [currentMonth, setCurrentMonth] = useState(new Date());
 
   // Form States
@@ -248,25 +358,28 @@ export default function App() {
     const unsub = onAuthStateChanged(auth, async (u) => {
       setUser(u);
       if (u) {
-        const snap = await getDoc(doc(db, 'users', u.uid));
-        if (snap.exists()) {
-          const profile = snap.data() as Teacher;
-          setUserProfile(profile);
-          setView(profile.role === 'admin' ? 'adminPortal' : 'teacherPortal');
-        } else if (u.email === 'jitendrakumart557@gmail.com') {
-          // Auto-provision admin
-          const profile: Teacher = {
-            uid: u.uid,
-            name: 'Master Admin',
-            email: u.email!,
-            mobile: '0000000000',
-            classes: [],
-            subjects: [],
-            role: 'admin'
-          };
-          await setDoc(doc(db, 'users', u.uid), profile);
-          setUserProfile(profile);
-          setView('adminPortal');
+        try {
+          const snap = await getDoc(doc(db, 'users', u.uid));
+          if (snap.exists()) {
+            const profile = snap.data() as Teacher;
+            setUserProfile(profile);
+            // Don't auto-redirect to portal on load if user wants landing page first
+            // setView(profile.role === 'admin' ? 'adminPortal' : 'teacherPortal');
+          } else if (u.email === 'jitendrakumart557@gmail.com' || u.email === 'admin@ssm.portal') {
+            const profile: Teacher = {
+              uid: u.uid,
+              name: u.email === 'admin@ssm.portal' ? 'SSM Admin' : 'Master Admin',
+              email: u.email!,
+              mobile: '0000000000',
+              classes: [],
+              subjects: [],
+              role: 'admin'
+            };
+            await setDoc(doc(db, 'users', u.uid), profile);
+            setUserProfile(profile);
+          }
+        } catch (error) {
+          handleFirestoreError(error, OperationType.GET, `users/${u.uid}`);
         }
       }
       setLoading(false);
@@ -274,14 +387,7 @@ export default function App() {
     return unsub;
   }, []);
 
-  const handleLogin = async (e: React.FormEvent) => {
-    e.preventDefault();
-    try {
-      await signInWithEmailAndPassword(auth, loginForm.email, loginForm.password);
-    } catch (err: any) {
-      alert("Login Error: " + err.message);
-    }
-  };
+  const [loginLoading, setLoginLoading] = useState(false);
 
   const handleLogout = async () => {
     await signOut(auth);
@@ -289,60 +395,212 @@ export default function App() {
     setUserProfile(null);
   };
 
-  // --- Data Loading Handlers ---
+  const handleLogin = async (e: React.FormEvent) => {
+    e.preventDefault();
+    setLoginLoading(true);
+    console.log("Attempting login for view:", view);
+    
+    if (view === 'adminLogin') {
+      const inputId = loginForm.email?.trim().toUpperCase();
+      console.log("Admin ID Input:", inputId);
+      
+      if (inputId === 'SSM100728' && loginForm.password === '9923123') {
+        const adminEmail = 'admin@ssm.portal';
+        const adminPass = '9923123';
+        try {
+          console.log("Authenticating admin...");
+          const res = await signInWithEmailAndPassword(auth, adminEmail, adminPass);
+          console.log("Admin authenticated, fetching profile...");
+          let profileSnap = await getDoc(doc(db, 'users', res.user.uid));
+          let profileData: Teacher;
+          
+          if (!profileSnap.exists()) {
+            console.log("Admin profile missing, creating...");
+            profileData = {
+              uid: res.user.uid,
+              name: 'SSM Admin',
+              email: adminEmail,
+              mobile: '0000000000',
+              classes: [],
+              subjects: [],
+              role: 'admin'
+            };
+            await setDoc(doc(db, 'users', res.user.uid), profileData);
+          } else {
+            console.log("Admin profile found.");
+            profileData = profileSnap.data() as Teacher;
+            if (profileData.role !== 'admin') {
+              profileData.role = 'admin';
+              await updateDoc(doc(db, 'users', res.user.uid), { role: 'admin' });
+            }
+          }
+          
+          setUserProfile(profileData);
+          setView('adminPortal');
+          console.log("Admin portal view set.");
+        } catch (err: any) {
+          console.error("Admin login error:", err);
+          if (err.code === 'auth/user-not-found') {
+            try {
+              const { createUserWithEmailAndPassword } = await import('firebase/auth');
+              const res = await createUserWithEmailAndPassword(auth, adminEmail, adminPass);
+              const profile: Teacher = {
+                uid: res.user.uid,
+                name: 'SSM Admin',
+                email: adminEmail,
+                mobile: '0000000000',
+                classes: [],
+                subjects: [],
+                role: 'admin'
+              };
+              await setDoc(doc(db, 'users', res.user.uid), profile);
+              setUserProfile(profile);
+              setView('adminPortal');
+            } catch (regErr: any) {
+              alert("Admin Creation Error: " + regErr.message);
+            }
+          } else {
+            alert("Admin Login Error: " + err.message);
+          }
+        } finally {
+          setLoginLoading(false);
+        }
+        return;
+      } else {
+        alert("Invalid Admin ID or Password. Check credentials.");
+        setLoginLoading(false);
+        return;
+      }
+    }
+
+    try {
+      console.log("Authenticating teacher:", loginForm.email);
+      const res = await signInWithEmailAndPassword(auth, loginForm.email, loginForm.password);
+      const profileSnap = await getDoc(doc(db, 'users', res.user.uid));
+      if (profileSnap.exists()) {
+        const profile = profileSnap.data() as Teacher;
+        setUserProfile(profile);
+        setView(profile.role === 'admin' ? 'adminPortal' : 'teacherPortal');
+        console.log("Teacher logged in, role:", profile.role);
+      } else {
+        alert("Profile not found. Please register first.");
+      }
+    } catch (err: any) {
+      console.error("Teacher login error:", err);
+      alert("Login Error: " + err.message);
+    } finally {
+      setLoginLoading(false);
+    }
+  };
+
+  useEffect(() => {
+    if (userProfile?.role !== 'admin' || leaves.length === 0) return;
+
+    const checkExpiredLeaves = async () => {
+      const today = format(new Date(), 'yyyy-MM-dd');
+      const expired = leaves.filter(l => l.status === 'pending' && l.startDate < today);
+      
+      for (const leave of expired) {
+        try {
+          await updateDoc(doc(db, 'leaves', leave.id), { status: 'rejected' });
+        } catch (e) {
+          console.error("Auto-reject error", e);
+        }
+      }
+    };
+    checkExpiredLeaves();
+  }, [leaves, userProfile]);
 
   useEffect(() => {
     if (!user || (userProfile?.role !== 'admin' && userProfile?.role !== 'teacher')) return;
 
-    const unsubTeachers = onSnapshot(collection(db, 'users'), (snap) => {
-      setAllTeachers(snap.docs.map(doc => ({ uid: doc.id, ...doc.data() } as Teacher)));
-    });
+    const unsubTeachers = userProfile?.role === 'admin' 
+      ? onSnapshot(collection(db, 'users'), 
+          (snap) => {
+            setAllTeachers(snap.docs.map(doc => ({ uid: doc.id, ...doc.data() } as Teacher)));
+          },
+          (error) => handleFirestoreError(error, OperationType.LIST, 'users')
+        )
+      : null;
 
-    const unsubAttendance = onSnapshot(collection(db, 'attendance'), (snap) => {
-      setAttendance(snap.docs.map(doc => ({ id: doc.id, ...doc.data() } as AttendanceRecord)));
-    });
+    const unsubAttendance = onSnapshot(
+      userProfile?.role === 'admin' 
+        ? collection(db, 'attendance') 
+        : query(collection(db, 'attendance'), where('teacherId', '==', user.uid)), 
+      (snap) => {
+        setAttendance(snap.docs.map(doc => ({ id: doc.id, ...doc.data() } as AttendanceRecord)));
+      },
+      (error) => handleFirestoreError(error, OperationType.LIST, 'attendance')
+    );
 
-    const unsubLeaves = onSnapshot(collection(db, 'leaves'), (snap) => {
-      setLeaves(snap.docs.map(doc => ({ id: doc.id, ...doc.data() } as LeaveRequest)));
-    });
+    const unsubLeaves = onSnapshot(
+      userProfile?.role === 'admin' 
+        ? collection(db, 'leaves') 
+        : query(collection(db, 'leaves'), where('teacherId', '==', user.uid)), 
+      (snap) => {
+        setLeaves(snap.docs.map(doc => ({ id: doc.id, ...doc.data() } as LeaveRequest)));
+      },
+      (error) => handleFirestoreError(error, OperationType.LIST, 'leaves')
+    );
 
-    const unsubArrangements = onSnapshot(collection(db, 'arrangements'), (snap) => {
-      setArrangements(snap.docs.map(doc => ({ id: doc.id, ...doc.data() } as Arrangement)));
-    });
+    const unsubArrangements = onSnapshot(collection(db, 'arrangements'), 
+      (snap) => {
+        setArrangements(snap.docs.map(doc => ({ id: doc.id, ...doc.data() } as Arrangement)));
+      },
+      (error) => handleFirestoreError(error, OperationType.LIST, 'arrangements')
+    );
 
-    const unsubStudentAtt = onSnapshot(collection(db, 'studentAttendance'), (snap) => {
-      setStudentAttendance(snap.docs.map(doc => ({ id: doc.id, ...doc.data() } as StudentAttendance)));
-    });
+    const unsubStudentAtt = onSnapshot(collection(db, 'studentAttendance'), 
+      (snap) => {
+        setStudentAttendance(snap.docs.map(doc => ({ id: doc.id, ...doc.data() } as StudentAttendance)));
+      },
+      (error) => handleFirestoreError(error, OperationType.LIST, 'studentAttendance')
+    );
 
-    const unsubHolidays = onSnapshot(collection(db, 'holidays'), (snap) => {
-      setHolidays(snap.docs.map(doc => ({ id: doc.id, ...doc.data() } as Holiday)));
-    });
+    const unsubHolidays = onSnapshot(collection(db, 'holidays'), 
+      (snap) => {
+        setHolidays(snap.docs.map(doc => ({ id: doc.id, ...doc.data() } as Holiday)));
+      },
+      (error) => handleFirestoreError(error, OperationType.LIST, 'holidays')
+    );
 
-    const unsubTimetable = onSnapshot(doc(db, 'settings', 'timetable'), (snap) => {
-      if (snap.exists()) setTimetable(snap.data().entries || []);
-    });
+    const unsubTimetable = onSnapshot(doc(db, 'settings', 'timetable'), 
+      (snap) => {
+        if (snap.exists()) setTimetable(snap.data().entries || []);
+      },
+      (error) => handleFirestoreError(error, OperationType.GET, 'settings/timetable')
+    );
 
-    const unsubRequirements = onSnapshot(doc(db, 'settings', 'subjectRequirements'), (snap) => {
-      if (snap.exists()) setSubjectRequirements(snap.data().requirements || []);
-    });
+    const unsubRequirements = onSnapshot(doc(db, 'settings', 'subjectRequirements'), 
+      (snap) => {
+        if (snap.exists()) setSubjectRequirements(snap.data().requirements || []);
+      },
+      (error) => handleFirestoreError(error, OperationType.GET, 'settings/subjectRequirements')
+    );
 
-    const unsubSettings = onSnapshot(doc(db, 'settings', 'school'), (snap) => {
-      if (snap.exists()) setSchoolSettings(snap.data() as SchoolSettings);
-    });
+    const unsubSettings = onSnapshot(doc(db, 'settings', 'school'), 
+      (snap) => {
+        if (snap.exists()) setSchoolSettings(snap.data() as SchoolSettings);
+      },
+      (error) => handleFirestoreError(error, OperationType.GET, 'settings/school')
+    );
 
-    const unsubCode = onSnapshot(query(collection(db, 'attendanceCodes'), orderBy('createdAt', 'desc'), limit(1)), (snap) => {
-      if (!snap.empty) {
-        const data = snap.docs[0].data();
-        if (isAfter(new Date(data.expiresAt), new Date())) {
-          setAttendanceCode(data.code);
-        } else {
-          setAttendanceCode(null);
+    const unsubCode = onSnapshot(query(collection(db, 'attendanceCodes'), orderBy('createdAt', 'desc'), limit(1)), 
+      (snap) => {
+        if (!snap.empty) {
+          const data = snap.docs[0].data();
+          if (isAfter(new Date(data.expiresAt), new Date())) {
+            setAttendanceCode(data.code);
+          } else {
+            setAttendanceCode(null);
+          }
         }
-      }
-    });
+      },
+      (error) => handleFirestoreError(error, OperationType.LIST, 'attendanceCodes')
+    );
 
     return () => {
-      unsubTeachers();
+      unsubTeachers?.();
       unsubAttendance();
       unsubLeaves();
       unsubArrangements();
@@ -409,6 +667,44 @@ export default function App() {
     const wb = XLSX.utils.book_new();
     XLSX.utils.book_append_sheet(wb, ws, "Attendance");
     XLSX.writeFile(wb, `Master_Attendance_${format(currentMonth, 'MMM_yyyy')}.xlsx`);
+  };
+
+  const exportTeacherAttendance = () => {
+    if (!userProfile) return;
+    const sessionStr = `${new Date().getFullYear()}-${(new Date().getFullYear() + 1).toString().slice(-2)}`;
+    
+    // Get all days from start of year to now
+    const days = eachDayOfInterval({
+      start: startOfYear(new Date()),
+      end: new Date()
+    });
+
+    const data = days.map(day => {
+      const dateStr = format(day, 'yyyy-MM-dd');
+      const isSun = getDay(day) === 0;
+      const holiday = holidays.find(h => h.date === dateStr);
+      
+      let status = 'Absent';
+      if (isSun) status = 'Sunday';
+      else if (holiday) status = holiday.reason;
+      else {
+        const att = attendance.some(a => a.teacherId === userProfile.uid && a.date === dateStr);
+        const leave = leaves.some(l => l.teacherId === userProfile.uid && l.status === 'approved' && dateStr >= l.startDate && dateStr <= l.endDate);
+        if (att) status = 'Present';
+        else if (leave) status = 'Leave';
+      }
+
+      return {
+        Date: dateStr,
+        Day: format(day, 'EEEE'),
+        Status: status
+      };
+    });
+
+    const ws = XLSX.utils.json_to_sheet(data);
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, "Attendance");
+    XLSX.writeFile(wb, `${userProfile.name}_Attendance_${sessionStr}.xlsx`);
   };
 
   const handleGenerateTimetable = async () => {
@@ -689,56 +985,97 @@ export default function App() {
   );
 
   return (
-    <div className="min-h-screen bg-[#F8FAFF] font-sans text-gray-900 pb-20 overflow-x-hidden">
-      {/* Navigation */}
-      <nav className="bg-white border-b border-indigo-50 sticky top-0 z-50 backdrop-blur-md bg-white/80">
-        <div className="max-w-7xl mx-auto px-6 h-20 flex justify-between items-center">
-          <div className="flex items-center gap-3">
-            <div className="w-12 h-12 bg-indigo-600 rounded-2xl flex items-center justify-center text-white shadow-xl shadow-indigo-600/30">
-              <GraduationCap className="w-7 h-7" />
-            </div>
-            <div>
-              <h1 className="text-xl font-black text-indigo-950 leading-tight">SSM DIGITAL</h1>
-              <p className="text-[10px] font-bold text-indigo-400 uppercase tracking-widest">School Management System</p>
-            </div>
-          </div>
-          
-          {userProfile && (
-            <div className="flex items-center gap-4">
-              <div className="hidden md:block text-right">
-                <p className="text-sm font-black text-indigo-950">{userProfile.name}</p>
-                <p className="text-[10px] font-bold text-indigo-400 uppercase">{userProfile.role}</p>
+    <ErrorBoundary>
+      <div className="min-h-screen bg-[#F8FAFF] font-sans text-gray-900 pb-20 overflow-x-hidden">
+        {/* Navigation */}
+        <nav className="bg-white border-b border-indigo-50 sticky top-0 z-50 backdrop-blur-md bg-white/80">
+          <div className="max-w-7xl mx-auto px-6 h-20 flex justify-between items-center">
+            <div className="flex items-center gap-3">
+              <div className="w-12 h-12 bg-indigo-600 rounded-2xl flex items-center justify-center text-white shadow-xl shadow-indigo-600/30">
+                <GraduationCap className="w-7 h-7" />
               </div>
-              <button 
-                onClick={handleLogout}
-                className="w-10 h-10 rounded-xl bg-red-50 text-red-500 flex items-center justify-center hover:bg-red-500 hover:text-white transition-all shadow-sm"
-              >
-                <LogOut className="w-5 h-5" />
-              </button>
-            </div>
-          )}
-        </div>
-      </nav>
-
-      <div className="max-w-7xl mx-auto px-6 py-8">
-        <AnimatePresence mode="wait">
-          {view === 'home' && (
-            <motion.div key="home" initial={{ opacity: 0, scale: 0.95 }} animate={{ opacity: 1, scale: 1 }} exit={{ opacity: 0, scale: 1.05 }} className="min-h-[70vh] flex flex-col items-center justify-center text-center">
-              <div className="mb-8 relative">
-                <div className="absolute -inset-10 bg-indigo-600/10 rounded-full blur-3xl"></div>
-                <GraduationCap className="w-24 h-24 text-indigo-600 relative" />
+              <div>
+                <h1 className="text-xl font-black text-indigo-950 leading-tight">S.S.M Sr. Sec. School, SURYAKUND</h1>
+                <p className="text-[10px] font-bold text-indigo-400 uppercase tracking-widest text-center">TEACHER MANAGEMENT PORTAL</p>
               </div>
-              <h2 className="text-5xl font-black text-indigo-950 mb-4">Saraswati Shishu Mandir</h2>
-              <p className="text-gray-500 max-w-lg mb-12 text-lg font-medium leading-relaxed">
-                Empowering education through seamless digital management. Secure portals for teachers and administrators.
-              </p>
-              <div className="flex flex-col md:flex-row gap-6 w-full max-w-md">
+            </div>
+            
+            {userProfile && (
+              <div className="flex items-center gap-4">
                 <button 
-                  onClick={() => setView('loginSelection')}
-                  className="flex-1 bg-indigo-600 text-white px-8 py-5 rounded-3xl font-black text-lg hover:bg-indigo-700 hover:shadow-2xl hover:shadow-indigo-600/20 hover:-translate-y-1 transition-all flex items-center justify-center gap-3"
+                  onClick={() => setView(userProfile.role === 'admin' ? 'adminPortal' : 'teacherPortal')}
+                  className="hidden sm:flex items-center gap-2 px-4 py-2 bg-indigo-50 text-indigo-600 rounded-xl text-[10px] font-black uppercase tracking-widest hover:bg-indigo-600 hover:text-white transition-all"
                 >
-                  Enter Portal <ArrowUpRight className="w-6 h-6" />
+                  <LayoutDashboard className="w-4 h-4" /> Dashboard
                 </button>
+                <div className="hidden md:block text-right">
+                  <p className="text-sm font-black text-indigo-950">{userProfile.name}</p>
+                  <p className="text-[10px] font-bold text-indigo-400 uppercase">{userProfile.role}</p>
+                </div>
+                <button 
+                  onClick={() => {
+                    if (window.confirm("Are you sure you want to logout?")) {
+                      handleLogout();
+                    }
+                  }}
+                  className="w-10 h-10 rounded-xl bg-red-50 text-red-500 flex items-center justify-center hover:bg-red-500 hover:text-white transition-all shadow-sm"
+                >
+                  <LogOut className="w-5 h-5" />
+                </button>
+              </div>
+            )}
+          </div>
+        </nav>
+
+        <div className="max-w-7xl mx-auto px-6 py-8">
+          <AnimatePresence mode="wait">
+            {/* ... rest of the component ... */}
+          {view === 'home' && (
+            <motion.div key="home" initial={{ opacity: 0, scale: 0.95 }} animate={{ opacity: 1, scale: 1 }} exit={{ opacity: 0, scale: 1.05 }} className="space-y-16 py-12">
+              <div className="min-h-[60vh] flex flex-col items-center justify-center text-center">
+                <div className="mb-8 relative">
+                  <div className="absolute -inset-10 bg-indigo-600/10 rounded-full blur-3xl"></div>
+                  <GraduationCap className="w-24 h-24 text-indigo-600 relative" />
+                </div>
+                <h2 className="text-4xl md:text-6xl font-black text-indigo-950 mb-4 tracking-tighter uppercase">S.S.M Sr. Sec. School, SURYAKUND</h2>
+                <h3 className="text-xl md:text-2xl font-bold text-indigo-600 mb-8 uppercase tracking-widest">Teacher Management Portal</h3>
+                
+                <div className="flex flex-col md:flex-row gap-6 w-full max-w-md mx-auto mb-16">
+                  <button 
+                    onClick={() => {
+                      if (userProfile) {
+                        setView(userProfile.role === 'admin' ? 'adminPortal' : 'teacherPortal');
+                      } else {
+                        setView('loginSelection');
+                      }
+                    }}
+                    className="flex-1 bg-indigo-600 text-white px-8 py-5 rounded-3xl font-black text-lg hover:bg-indigo-700 hover:shadow-2xl hover:shadow-indigo-600/20 hover:-translate-y-1 transition-all flex items-center justify-center gap-3"
+                  >
+                    LOGIN TO PORTAL <ArrowUpRight className="w-6 h-6" />
+                  </button>
+                </div>
+
+                <div className="grid md:grid-cols-2 gap-12 text-left mt-12">
+                  <div className="bg-white p-8 rounded-[2rem] border border-indigo-50 shadow-sm">
+                    <h4 className="text-xl font-black text-indigo-950 mb-4 flex items-center gap-2">
+                       <Info className="w-5 h-5 text-indigo-600" /> About the Portal
+                    </h4>
+                    <p className="text-gray-600 leading-relaxed">
+                      S.S.M Digital is a comprehensive Teacher Management solution designed specifically for S.S.M Sr. Sec. School, SURYAKUND. It streamlines attendance, timetable generation, and substitution arrangements, allowing educators to focus more on teaching and less on paperwork.
+                    </p>
+                  </div>
+                  <div className="bg-white p-8 rounded-[2rem] border border-indigo-50 shadow-sm">
+                    <h4 className="text-xl font-black text-indigo-950 mb-4 flex items-center gap-2">
+                       <HelpCircle className="w-5 h-5 text-indigo-600" /> How to use?
+                    </h4>
+                    <ul className="text-gray-600 space-y-3 list-disc pl-5">
+                      <li>Teachers must register using their mobile number and assigned classes.</li>
+                      <li>Use the daily attendance code provided by the Admin to mark your presence.</li>
+                      <li>Check your dashboard for any substitution arrangements assigned to you.</li>
+                      <li>Admins can manage the master timetable and approve leave requests.</li>
+                    </ul>
+                  </div>
+                </div>
               </div>
             </motion.div>
           )}
@@ -775,12 +1112,12 @@ export default function App() {
               <Card title={`${view === 'adminLogin' ? 'Admin' : 'Teacher'} Secure Access`}>
                 <form onSubmit={handleLogin} className="space-y-5">
                   <div className="space-y-2">
-                    <label className="text-[10px] font-black text-indigo-400 uppercase ml-2">Official Email</label>
+                    <label className="text-[10px] font-black text-indigo-400 uppercase ml-2">{view === 'adminLogin' ? 'Admin ID' : 'Official Email'}</label>
                     <div className="relative">
-                      <Mail className="absolute left-4 top-3.5 w-5 h-5 text-gray-400" />
+                      {view === 'adminLogin' ? <ShieldCheck className="absolute left-4 top-3.5 w-5 h-5 text-gray-400" /> : <Mail className="absolute left-4 top-3.5 w-5 h-5 text-gray-400" />}
                       <input 
-                        type="email" required placeholder="name@ssm.portal" 
-                        className="w-full pl-12 pr-4 py-3.5 bg-gray-50 border border-indigo-50 rounded-2xl outline-none focus:border-indigo-600 transition-all"
+                        type={view === 'adminLogin' ? 'text' : 'email'} required placeholder={view === 'adminLogin' ? 'SSMXXXXXX' : 'name@ssm.portal'} 
+                        className="w-full pl-12 pr-4 py-3.5 bg-gray-50 border border-indigo-50 rounded-2xl outline-none focus:border-indigo-600 transition-all font-bold"
                         value={loginForm.email} onChange={e => setLoginForm({...loginForm, email: e.target.value})}
                       />
                     </div>
@@ -791,13 +1128,118 @@ export default function App() {
                       <Lock className="absolute left-4 top-3.5 w-5 h-5 text-gray-400" />
                       <input 
                         type="password" required placeholder="••••••••" 
-                        className="w-full pl-12 pr-4 py-3.5 bg-gray-50 border border-indigo-50 rounded-2xl outline-none focus:border-indigo-600 transition-all"
+                        className="w-full pl-12 pr-4 py-3.5 bg-gray-50 border border-indigo-50 rounded-2xl outline-none focus:border-indigo-600 transition-all font-bold"
                         value={loginForm.password} onChange={e => setLoginForm({...loginForm, password: e.target.value})}
                       />
                     </div>
                   </div>
+                  <button 
+                    type="submit" 
+                    disabled={loginLoading}
+                    className="w-full bg-indigo-600 text-white font-black py-4 rounded-2xl shadow-xl shadow-indigo-600/20 hover:bg-indigo-700 transition-all uppercase tracking-widest text-sm disabled:opacity-50 flex items-center justify-center gap-2"
+                  >
+                    {loginLoading ? <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin"></div> : 'Access Portal'}
+                  </button>
+
+                  {view === 'teacherLogin' && (
+                    <p className="text-center text-xs text-gray-500 mt-4">
+                      New user? <button type="button" onClick={() => setView('teacherSignUp' as any)} className="text-indigo-600 font-bold hover:underline">Sign in</button>
+                    </p>
+                  )}
+                </form>
+              </Card>
+            </motion.div>
+          )}
+
+          {view === 'teacherSignUp' && (
+            <motion.div key="signup" initial={{ opacity: 0, y: 30 }} animate={{ opacity: 1, y: 0 }} className="max-w-2xl mx-auto">
+              <button onClick={() => setView('teacherLogin' as any)} className="mb-6 text-indigo-400 font-bold flex items-center gap-2 uppercase text-[10px] tracking-widest"><ChevronLeft className="w-3 h-3"/> Back to Login</button>
+              <Card title="Teacher Registration">
+                <form onSubmit={async (e) => {
+                  e.preventDefault();
+                  const form = e.target as HTMLFormElement;
+                  const data = new FormData(form);
+                  const name = data.get('name') as string;
+                  const mobile = data.get('mobile') as string;
+                  const email = data.get('email') as string;
+                  const password = data.get('password') as string;
+                  
+                  // Get multi-select values
+                  const selectedClasses = FLattenClasses.filter((_, i) => (document.getElementById(`class-${i}`) as HTMLInputElement)?.checked);
+                  const selectedSubjects = schoolSettings.subjects.filter((_, i) => (document.getElementById(`sub-${i}`) as HTMLInputElement)?.checked);
+
+                  if (selectedClasses.length === 0 || selectedSubjects.length === 0) {
+                    alert("Please select classes and subjects.");
+                    return;
+                  }
+
+                  try {
+                    const { createUserWithEmailAndPassword } = await import('firebase/auth');
+                    const res = await createUserWithEmailAndPassword(auth, email, password);
+                    const profile: Teacher = {
+                      uid: res.user.uid,
+                      name,
+                      mobile,
+                      email,
+                      classes: selectedClasses,
+                      subjects: selectedSubjects,
+                      role: 'teacher'
+                    };
+                    await setDoc(doc(db, 'users', res.user.uid), profile);
+                    setUserProfile(profile);
+                    setView('teacherPortal');
+                  } catch (err: any) {
+                    alert("Registration Error: " + err.message);
+                  }
+                }} className="space-y-6">
+                  <div className="grid md:grid-cols-2 gap-6">
+                    <div className="space-y-2">
+                       <label className="text-[10px] font-black text-indigo-400 uppercase ml-2">Full Name</label>
+                       <input name="name" type="text" required placeholder="John Doe" className="w-full px-4 py-3 bg-gray-50 border border-indigo-50 rounded-2xl outline-none focus:border-indigo-600 transition-all font-bold" />
+                    </div>
+                    <div className="space-y-2">
+                       <label className="text-[10px] font-black text-indigo-400 uppercase ml-2">Mobile Number</label>
+                       <input name="mobile" type="tel" required placeholder="9876543210" className="w-full px-4 py-3 bg-gray-50 border border-indigo-50 rounded-2xl outline-none focus:border-indigo-600 transition-all font-bold" />
+                    </div>
+                  </div>
+                  <div className="grid md:grid-cols-2 gap-6">
+                    <div className="space-y-2">
+                       <label className="text-[10px] font-black text-indigo-400 uppercase ml-2">Official Email</label>
+                       <input name="email" type="email" required placeholder="name@ssm.portal" className="w-full px-4 py-3 bg-gray-50 border border-indigo-50 rounded-2xl outline-none focus:border-indigo-600 transition-all font-bold" />
+                    </div>
+                    <div className="space-y-2">
+                       <label className="text-[10px] font-black text-indigo-400 uppercase ml-2">Create Password</label>
+                       <input name="password" type="password" required placeholder="••••••••" className="w-full px-4 py-3 bg-gray-50 border border-indigo-50 rounded-2xl outline-none focus:border-indigo-600 transition-all font-bold" />
+                    </div>
+                  </div>
+
+                  <div className="space-y-4">
+                    <label className="text-[10px] font-black text-indigo-600 uppercase tracking-widest">Select Assigned Classes (6 - 12)</label>
+                    <div className="grid grid-cols-3 sm:grid-cols-4 md:grid-cols-6 gap-2">
+                       {FLattenClasses.map((cls, i) => (
+                         <label key={cls} className="flex items-center gap-2 p-2 bg-gray-50 rounded-xl cursor-pointer hover:bg-indigo-50 transition-all">
+                           <input type="checkbox" id={`class-${i}`} className="w-4 h-4 rounded border-gray-300 text-indigo-600 focus:ring-indigo-600" />
+                           <span className="text-[10px] font-bold text-gray-700">{cls}</span>
+                         </label>
+                       ))}
+                    </div>
+                  </div>
+
+                  <div className="space-y-4">
+                    <label className="text-[10px] font-black text-indigo-600 uppercase tracking-widest">Select Teaching Subjects</label>
+                    <div className="flex flex-wrap gap-2">
+                       {schoolSettings.subjects.map((sub, i) => (
+                         <label key={sub} className="flex items-center gap-2 p-2 px-4 bg-gray-50 rounded-xl cursor-pointer hover:bg-indigo-50 transition-all">
+                           <input type="checkbox" id={`sub-${i}`} className="w-4 h-4 rounded border-gray-300 text-indigo-600 focus:ring-indigo-600" />
+                           <span className="text-xs font-bold text-gray-700">{sub}</span>
+                         </label>
+                       ))}
+                       {schoolSettings.subjects.length === 0 && <p className="text-[10px] text-gray-400">Loading subjects from system...</p>}
+                    </div>
+                  </div>
+
                   <button type="submit" className="w-full bg-indigo-600 text-white font-black py-4 rounded-2xl shadow-xl shadow-indigo-600/20 hover:bg-indigo-700 transition-all uppercase tracking-widest text-sm">
-                    Access Portal
+                    Complete Registration
                   </button>
                 </form>
               </Card>
@@ -813,6 +1255,7 @@ export default function App() {
                   { id: 'attendance', icon: CalendarCheck, label: 'ATTENDANCE' },
                   { id: 'arrangement', icon: Sparkles, label: 'ARRANGEMENT' },
                   { id: 'teachers', icon: Users, label: 'TEACHERS' },
+                  { id: 'students', icon: UserCheck, label: 'STUDENTS' },
                   { id: 'timetable', icon: Clock, label: 'TIMETABLE' }
                 ].map(item => (
                   <button 
@@ -923,227 +1366,324 @@ export default function App() {
               )}
 
               {activeAdminSection === 'arrangement' && (
-                <div className="space-y-8">
-                  <div className="flex justify-center mb-4">
-                    <div className="bg-white p-2 rounded-[2rem] shadow-sm border border-indigo-50 flex gap-2">
-                      <button onClick={() => setActiveArrangementTab('generate')} className={`px-8 py-3 rounded-3xl font-black text-xs transition-all ${activeArrangementTab === 'generate' ? 'bg-indigo-600 text-white shadow-xl' : 'text-gray-400 hover:bg-gray-50'}`}>GENERATE TODAY</button>
-                      <button onClick={() => setActiveArrangementTab('view')} className={`px-8 py-3 rounded-3xl font-black text-xs transition-all ${activeArrangementTab === 'view' ? 'bg-indigo-600 text-white shadow-xl' : 'text-gray-400 hover:bg-gray-50'}`}>VIEW ARCHIVE</button>
-                      <button onClick={() => setActiveArrangementTab('leaves')} className={`px-8 py-3 rounded-3xl font-black text-xs transition-all ${activeArrangementTab === 'leaves' ? 'bg-indigo-600 text-white shadow-xl' : 'text-gray-400 hover:bg-gray-50'}`}>LEAVE REQUESTS</button>
-                    </div>
+                <div className="space-y-6">
+                  <div className="bg-white p-2 rounded-[2rem] border border-indigo-50 shadow-sm inline-flex gap-2">
+                    {[
+                      { id: 'view', label: 'PREVIOUS', icon: History },
+                      { id: 'generate', label: 'GENERATE/VIEW TODAY', icon: Sparkles },
+                      { id: 'leaves', label: 'LEAVE REQUESTS', icon: Mail }
+                    ].map(tab => (
+                      <button 
+                        key={tab.id}
+                        onClick={() => setActiveArrangementTab(tab.id as any)}
+                        className={`px-8 py-3 rounded-[1.5rem] font-black text-xs transition-all ${activeArrangementTab === tab.id ? 'bg-indigo-600 text-white shadow-xl' : 'text-indigo-400 hover:bg-gray-50'}`}
+                      >
+                        {tab.label}
+                      </button>
+                    ))}
                   </div>
 
                   {activeArrangementTab === 'view' && (
-                    <Card title="Arrangement Archive" icon={History} headerAction={
-                      <div className="flex items-center gap-4 bg-white/10 p-1 rounded-xl">
-                         <button onClick={() => setArrangementDate(subDays(arrangementDate, 1))} className="p-1 hover:bg-white/20 rounded text-white"><ChevronLeft className="w-4 h-4"/></button>
-                         <span className="text-xs font-black text-white min-w-[120px] text-center">{format(arrangementDate, 'dd MMM yyyy').toUpperCase()}</span>
-                         <button onClick={() => setArrangementDate(addDays(arrangementDate, 1))} className="p-1 hover:bg-white/20 rounded text-white"><ChevronRight className="w-4 h-4"/></button>
-                      </div>
-                    }>
-                      <div className="grid md:grid-cols-2 lg:grid-cols-3 gap-6">
-                        {arrangements.filter(a => a.date === format(arrangementDate, 'yyyy-MM-dd')).flatMap(a => a.absentTeachers).map((at, idx) => (
-                           <div key={idx} className="bg-white border-2 border-indigo-50 rounded-3xl p-6 shadow-sm overflow-hidden relative">
-                             <div className="flex items-center gap-4 mb-4 border-b pb-4">
-                               <div className="w-10 h-10 bg-red-50 text-red-500 rounded-full flex items-center justify-center">
-                                 <UserX className="w-5 h-5"/>
-                               </div>
-                               <div>
-                                 <p className="text-[10px] font-black text-gray-400 uppercase">Absent Teacher</p>
-                                 <h5 className="font-bold text-indigo-950">{at.teacherName}</h5>
-                               </div>
+                    <Card title="Previous Arrangements" icon={History} 
+                      headerAction={
+                        <div className="flex items-center gap-4 bg-white/10 px-4 py-1 rounded-xl">
+                           <button onClick={() => setArrangementDate(prev => subDays(prev, 1))} className="text-white hover:text-indigo-300"><ChevronLeft className="w-5 h-5"/></button>
+                           <span className="text-xs font-black text-white min-w-[120px] text-center">{format(arrangementDate, 'dd MMM yyyy')}</span>
+                           <button onClick={() => setArrangementDate(prev => addDays(prev, 1))} className="text-white hover:text-indigo-300"><ChevronRight className="w-5 h-5"/></button>
+                        </div>
+                      }
+                    >
+                       <div className="grid md:grid-cols-2 lg:grid-cols-3 gap-6">
+                          {arrangements.find(a => a.date === format(arrangementDate, 'yyyy-MM-dd'))?.substitutions.reduce((acc: any[], sub) => {
+                             let existing = acc.find(x => x.absentTeacherId === sub.absentTeacherId);
+                             if (existing) {
+                               existing.subs.push(sub);
+                             } else {
+                               acc.push({ absentTeacherId: sub.absentTeacherId, absentTeacherName: sub.absentTeacherName, subs: [sub] });
+                             }
+                             return acc;
+                          }, []).map((at, idx) => (
+                             <div key={idx} className="bg-white border-2 border-indigo-50 rounded-3xl p-6 shadow-sm border-t-8 border-red-500">
+                                <h5 className="font-black text-indigo-950 mb-4 border-b pb-2 text-center text-lg">{at.absentTeacherName}</h5>
+                                <table className="w-full text-[10px]">
+                                   <thead>
+                                     <tr className="text-indigo-400 uppercase font-black border-b border-indigo-50">
+                                       <th className="text-left py-2">PERIOD</th>
+                                       <th className="text-left py-2">CLASS</th>
+                                       <th className="text-left py-2">SUBSTITUTE</th>
+                                     </tr>
+                                   </thead>
+                                   <tbody>
+                                      {at.subs.sort((a,b) => a.period - b.period).map((s, i) => (
+                                        <tr key={i} className="border-b last:border-0 border-indigo-50/50">
+                                           <td className="py-3 font-black text-indigo-600">Bell {s.period}</td>
+                                           <td className="py-3 font-bold">{s.class}</td>
+                                           <td className="py-3 font-black text-gray-700 bg-indigo-50/50 px-3 rounded-lg">{s.substituteName}</td>
+                                        </tr>
+                                      ))}
+                                   </tbody>
+                                </table>
                              </div>
-                             <table className="w-full text-[10px]">
-                               <thead>
-                                 <tr className="text-gray-400 border-b">
-                                   <th className="pb-2 text-left">BELL</th>
-                                   <th className="pb-2 text-left">CLASS</th>
-                                   <th className="pb-2 text-left">SUBSTITUTE</th>
-                                 </tr>
-                               </thead>
-                               <tbody>
-                                 {at.substitutions.map((s, i) => (
-                                   <tr key={i} className="border-b last:border-0">
-                                     <td className="py-2 font-black text-indigo-600">B{s.bell}</td>
-                                     <td className="py-2 font-bold">{s.class}</td>
-                                     <td className="py-2 font-black text-gray-700">{s.substituteName}</td>
-                                   </tr>
-                                 ))}
-                               </tbody>
-                             </table>
-                           </div>
-                        ))}
-                        {arrangements.filter(a => a.date === format(arrangementDate, 'yyyy-MM-dd')).length === 0 && (
-                          <div className="col-span-full py-20 text-center text-gray-400 italic">No arrangements for this date.</div>
-                        )}
-                      </div>
+                          ))}
+                          {(!arrangements.find(a => a.date === format(arrangementDate, 'yyyy-MM-dd'))) && (
+                             <div className="text-center py-20 col-span-full italic text-gray-400">No arrangement data for this date.</div>
+                          )}
+                       </div>
                     </Card>
                   )}
 
                   {activeArrangementTab === 'generate' && (
-                    <div className="space-y-8">
-                       <Card title="Live Arrangement Feed" icon={Sparkles}>
-                         <div className="flex justify-between items-center mb-6">
-                           <h4 className="font-black text-indigo-950">TODAY: {format(new Date(), 'dd MMM yyyy')}</h4>
-                           <button 
-                             onClick={async () => {
-                               // Generate logic
-                               const today = format(new Date(), 'yyyy-MM-dd');
-                               const todayName = format(new Date(), 'EEEE');
-                               const absentTeachers = leaves
-                                 .filter(l => l.status === 'approved' && today >= l.startDate && today <= l.endDate)
-                                 .map(l => ({ teacherId: l.teacherId, teacherName: l.teacherName }));
-                               
-                               if (absentTeachers.length === 0) return alert("No approved leaves for today.");
+                    <Card title="Substitution Manager" icon={Sparkles}>
+                       <div className="flex flex-col md:flex-row justify-between items-center mb-10 gap-6">
+                          <div>
+                             <h4 className="text-2xl font-black text-indigo-950">Daily Arrangement Status</h4>
+                             <p className="text-xs font-bold text-gray-400 uppercase tracking-widest">{format(new Date(), 'EEEE, dd MMMM yyyy')}</p>
+                          </div>
+                          {!arrangements.some(a => a.date === format(new Date(), 'yyyy-MM-dd')) ? (
+                            <button 
+                              onClick={async () => {
+                                const todayDate = format(new Date(), 'yyyy-MM-dd');
+                                const dayName = format(new Date(), 'EEEE');
+                                const absentIds = leaves.filter(l => l.status === 'approved' && todayDate >= l.startDate && todayDate <= l.endDate).map(l => l.teacherId);
+                                
+                                if (absentIds.length === 0) return alert("All staff members are present (No approved leaves today).");
 
-                               const teacherList = absentTeachers.map(at => {
-                                  const tt = timetable.filter(entry => entry.teacherId === at.teacherId && entry.day === todayName);
-                                  return {
-                                    teacherId: at.teacherId,
-                                    teacherName: at.teacherName,
-                                    substitutions: tt.map(entry => {
-                                      // Simple substitution: first available teacher
-                                      const level = entry.class;
-                                      const section = entry.section;
-                                      const freeTeacher = allTeachers.find(t => 
-                                        !absentTeachers.some(at2 => at2.teacherId === t.uid) && // not absent
-                                        !timetable.some(te => te.teacherId === t.uid && te.day === todayName && te.bell === entry.bell) // free at this bell
-                                      );
-                                      return {
-                                        bell: entry.bell,
-                                        class: `${level}${section}`,
-                                        substituteId: freeTeacher?.uid || 'NONE',
-                                        substituteName: freeTeacher?.name || 'FREE BELL'
-                                      };
-                                    })
-                                  };
-                               });
+                                const newSubs: any[] = [];
+                                absentIds.forEach(absId => {
+                                  const tt = timetable.filter(e => e.teacherId === absId && e.day === dayName);
+                                  const absentName = allTeachers.find(t => t.uid === absId)?.name || 'Unknown';
+                                  
+                                  tt.forEach(period => {
+                                    const freeTeachers = allTeachers.filter(t => 
+                                      !absentIds.includes(t.uid) && 
+                                      !timetable.some(e => e.teacherId === t.uid && e.day === dayName && e.bell === period.bell)
+                                    );
+                                    
+                                    const sub = freeTeachers[Math.floor(Math.random() * freeTeachers.length)];
+                                    newSubs.push({
+                                      absentTeacherId: absId,
+                                      absentTeacherName: absentName,
+                                      period: period.bell,
+                                      class: `${period.class}${period.section}`,
+                                      subject: period.subject,
+                                      substituteId: sub?.uid || 'UNASSIGNED',
+                                      substituteName: sub?.name || 'FREE PERIOD'
+                                    });
+                                  });
+                                });
 
-                               await setDoc(doc(db, 'arrangements', today), {
-                                 date: today,
-                                 absentTeachers: teacherList
-                               });
-                               alert("Arrangement Generated!");
-                             }}
-                             className="bg-indigo-600 text-white px-8 py-3 rounded-2xl font-black text-xs hover:bg-indigo-700 transition-all flex items-center gap-2 shadow-xl shadow-indigo-200"
-                           >
-                             <Sparkles className="w-4 h-4" /> GENERATE FOR TODAY
-                           </button>
-                         </div>
-                         <div className="grid md:grid-cols-2 lg:grid-cols-3 gap-6">
-                            {arrangements.filter(a => a.date === format(new Date(), 'yyyy-MM-dd')).flatMap(a => a.absentTeachers).map((at, idx) => (
-                               <div key={idx} className="bg-white border-2 border-indigo-50 rounded-3xl p-6 shadow-sm overflow-hidden">
-                                  <div className="flex items-center gap-4 mb-4 border-b pb-4">
-                                     <div className="w-10 h-10 bg-red-50 text-red-500 rounded-full flex items-center justify-center"><UserX className="w-5 h-5"/></div>
-                                     <h5 className="font-bold text-indigo-950">{at.teacherName}</h5>
+                                await setDoc(doc(db, 'arrangements', todayDate), {
+                                  date: todayDate,
+                                  substitutions: newSubs,
+                                  createdAt: new Date().toISOString()
+                                });
+                                alert("Success: Substitution table generated!");
+                              }}
+                              className="bg-indigo-600 text-white px-12 py-5 rounded-3xl font-black text-sm hover:bg-indigo-700 transition-all shadow-2xl shadow-indigo-600/20 active:scale-95"
+                            >
+                              GENERATE TODAY'S ARRANGEMENT
+                            </button>
+                          ) : (
+                            <div className="flex items-center gap-4 bg-green-50 text-green-600 px-8 py-3 rounded-2xl border-2 border-green-200">
+                               <CheckCircle2 className="w-6 h-6" />
+                               <span className="font-black text-sm uppercase">Arrangement Live</span>
+                            </div>
+                          )}
+                       </div>
+                       
+                       <div className="grid md:grid-cols-2 lg:grid-cols-3 gap-8">
+                        {arrangements.find(a => a.date === format(new Date(), 'yyyy-MM-dd'))?.substitutions.reduce((acc: any[], sub) => {
+                           let existing = acc.find(x => x.absentTeacherId === sub.absentTeacherId);
+                           if (existing) {
+                             existing.subs.push(sub);
+                           } else {
+                             acc.push({ absentTeacherId: sub.absentTeacherId, absentTeacherName: sub.absentTeacherName, subs: [sub] });
+                           }
+                           return acc;
+                        }, []).map((at, idx) => (
+                           <div key={idx} className="bg-white border-2 border-indigo-50 rounded-[2.5rem] p-8 shadow-sm transition-all hover:shadow-xl hover:border-indigo-200 border-t-[12px] border-t-indigo-600">
+                             <h5 className="font-black text-indigo-950 mb-6 text-center text-xl">{at.absentTeacherName}</h5>
+                             <div className="space-y-4">
+                                {at.subs.sort((a,b) => a.period - b.period).map((s, i) => (
+                                  <div key={i} className="flex items-center justify-between p-4 bg-gray-50 rounded-2xl border border-indigo-50">
+                                     <div>
+                                        <p className="text-[10px] font-black text-indigo-400 uppercase leading-none mb-1">Bell {s.period}</p>
+                                        <p className="font-black text-indigo-900">{s.class}</p>
+                                     </div>
+                                     <div className="text-right">
+                                        <p className="text-[9px] font-black text-gray-400 uppercase leading-none mb-1">Substitute</p>
+                                        <p className="font-bold text-gray-700">{s.substituteName}</p>
+                                     </div>
                                   </div>
-                                  <table className="w-full text-[10px]">
-                                     <tbody>
-                                       {at.substitutions.map((s, i) => (
-                                         <tr key={i} className="border-b last:border-0">
-                                            <td className="py-2 text-indigo-600 font-black">B{s.bell}</td>
-                                            <td className="py-2 font-bold">{s.class}</td>
-                                            <td className="py-2 font-black text-gray-700">{s.substituteName}</td>
-                                         </tr>
-                                       ))}
-                                     </tbody>
-                                  </table>
-                               </div>
-                            ))}
-                            {arrangements.filter(a => a.date === format(new Date(), 'yyyy-MM-dd')).length === 0 && (
-                              <div className="col-span-full py-20 text-center text-gray-400 italic">Today's arrangement not generated yet.</div>
-                            )}
-                         </div>
-                       </Card>
-                    </div>
+                                ))}
+                             </div>
+                           </div>
+                        ))}
+                      </div>
+                    </Card>
                   )}
 
                   {activeArrangementTab === 'leaves' && (
-                    <div className="grid md:grid-cols-2 gap-6">
-                      {leaves.sort((a,b) => b.startDate.localeCompare(a.startDate)).map(l => (
-                        <div key={l.id} className="bg-white p-8 rounded-[2rem] border-2 border-indigo-50 shadow-sm flex flex-col justify-between group hover:border-indigo-600 transition-all">
-                          <div>
-                            <div className="flex justify-between items-start mb-4">
-                              <div>
-                                <h5 className="text-xl font-black text-indigo-950">{l.teacherName}</h5>
-                                <p className="text-xs font-bold text-indigo-400">{l.mobile}</p>
-                              </div>
-                              <span className={`px-3 py-1 rounded-full text-[10px] font-black uppercase ${l.status === 'approved' ? 'bg-green-100 text-green-600' : l.status === 'rejected' ? 'bg-red-100 text-red-600' : 'bg-orange-100 text-orange-600'}`}>
-                                {l.status}
-                              </span>
-                            </div>
-                            <div className="bg-gray-50 p-4 rounded-2xl mb-4 border border-indigo-50/50">
-                              <p className="text-[10px] font-black text-gray-400 uppercase mb-2">Leave Duration</p>
-                              <div className="flex items-center gap-3 text-sm font-bold text-gray-700">
-                                <Calendar className="w-4 h-4 text-indigo-400" />
-                                {format(parseISO(l.startDate), 'dd MMM')} to {format(parseISO(l.endDate), 'dd MMM yyyy')}
-                              </div>
-                            </div>
-                            <p className="text-gray-600 text-xs leading-relaxed italic border-l-4 border-indigo-200 pl-4">{l.reason}</p>
+                    <Card title="Active Leave Applications" icon={Mail}>
+                       <div className="grid md:grid-cols-2 lg:grid-cols-3 gap-6">
+                        {leaves.filter(l => l.status === 'pending').map(l => (
+                          <div key={l.id} className="bg-white p-8 rounded-[2rem] border-2 border-indigo-50 hover:border-indigo-600 transition-all">
+                             <div className="flex justify-between items-start mb-6">
+                                <div>
+                                   <h5 className="text-2xl font-black text-indigo-950 leading-tight">{l.teacherName}</h5>
+                                   <p className="text-xs font-bold text-indigo-400">{l.mobile}</p>
+                                </div>
+                                <span className="bg-orange-50 text-orange-600 rounded-full px-3 py-1 text-[10px] font-black uppercase tracking-widest border border-orange-100">Review</span>
+                             </div>
+                             <div className="bg-gray-50 p-5 rounded-2xl mb-6 relative overflow-hidden">
+                                <div className="absolute top-0 left-0 w-1 h-full bg-indigo-200"></div>
+                                <p className="text-xs font-bold text-indigo-950 mb-2 flex items-center gap-2"><Calendar className="w-4 h-4 text-indigo-400"/> {l.startDate} to {l.endDate}</p>
+                                <p className="text-sm italic text-gray-600">"{l.reason}"</p>
+                             </div>
+                             <div className="flex gap-4">
+                                <button onClick={() => updateDoc(doc(db, 'leaves', l.id), { status: 'approved' })} className="flex-1 bg-green-500 text-white font-black py-4 rounded-xl text-xs hover:bg-green-600 shadow-lg shadow-green-100 uppercase">Approve</button>
+                                <button onClick={() => updateDoc(doc(db, 'leaves', l.id), { status: 'rejected' })} className="flex-1 bg-red-100 text-red-500 font-black py-4 rounded-xl text-xs hover:bg-red-500 hover:text-white uppercase transition-all">Reject</button>
+                             </div>
                           </div>
-                          
-                          {l.status === 'pending' && (
-                            <div className="flex gap-4 mt-8">
-                              <button 
-                                onClick={() => updateDoc(doc(db, 'leaves', l.id), { status: 'approved' })}
-                                className="flex-1 bg-green-600 text-white py-3 rounded-2xl font-black text-[10px] tracking-widest hover:bg-green-700 shadow-lg shadow-green-600/20"
-                              >APPROVE</button>
-                               <button 
-                                onClick={() => updateDoc(doc(db, 'leaves', l.id), { status: 'rejected' })}
-                                className="flex-1 bg-red-600 text-white py-3 rounded-2xl font-black text-[10px] tracking-widest hover:bg-red-700 shadow-lg shadow-red-600/20"
-                              >REJECT</button>
-                            </div>
-                          )}
-                        </div>
-                      ))}
-                    </div>
+                        ))}
+                        {leaves.filter(l => l.status === 'pending').length === 0 && (
+                          <div className="col-span-full py-24 text-center">
+                             <Mail className="w-16 h-16 text-indigo-100 mx-auto mb-4" />
+                             <p className="text-gray-400 italic font-bold">Inbox clear. No pending leave requests to review.</p>
+                          </div>
+                        )}
+                      </div>
+                    </Card>
                   )}
                 </div>
               )}
 
               {activeAdminSection === 'teachers' && (
-                <Card title="Teacher Repository" icon={Users}>
-                  <div className="overflow-x-auto rounded-2xl border border-indigo-50">
-                    <table className="w-full text-xs">
-                      <thead className="bg-gray-50 border-b">
-                        <tr>
-                          <th className="p-4 text-left font-black text-indigo-900">IDENTIFIER</th>
-                          <th className="p-4 text-left font-black text-indigo-900">CONTACT</th>
-                          <th className="p-4 text-left font-black text-indigo-900">ASSIGNMENTS</th>
-                          <th className="p-4 text-left font-black text-indigo-900">ATTENDANCE (MO)</th>
-                          <th className="p-4 text-center font-black text-indigo-900">ACTIONS</th>
-                        </tr>
-                      </thead>
-                      <tbody>
-                        {allTeachers.map(t => (
-                          <tr key={t.uid} className="border-b last:border-0 hover:bg-indigo-50/20 transition-all">
-                            <td className="p-4">
-                              <p className="font-black text-gray-900 capitalize">{t.name}</p>
-                              <p className="text-[10px] text-gray-400 font-mono tracking-tighter">{t.uid}</p>
-                            </td>
-                            <td className="p-4">
-                              <p className="font-bold text-gray-700">{t.email}</p>
-                              <p className="text-[10px] text-gray-400">{t.mobile}</p>
-                            </td>
-                            <td className="p-4">
-                              <div className="flex flex-wrap gap-1">
-                                {t.classes.map(c => <span key={c} className="px-2 py-0.5 bg-indigo-50 text-indigo-600 rounded-md text-[8px] font-black">{c}</span>)}
-                              </div>
-                            </td>
-                            <td className="p-4">
-                              <span className="font-black text-indigo-600">{attendance.filter(a => a.teacherId === t.uid && format(new Date(a.date), 'MM') === format(new Date(), 'MM')).length} days</span>
-                            </td>
-                            <td className="p-4 text-center">
-                              <button 
-                                onClick={() => deleteDoc(doc(db, 'users', t.uid))}
-                                className="w-8 h-8 rounded-lg bg-red-50 text-red-400 hover:bg-red-500 hover:text-white transition-all mx-auto flex items-center justify-center border border-red-100"
-                              ><Trash2 className="w-4 h-4"/></button>
-                            </td>
-                          </tr>
-                        ))}
-                      </tbody>
-                    </table>
-                  </div>
-                </Card>
+                <div className="space-y-6">
+                  <Card title="Institutional Faculty List" icon={Users} 
+                    headerAction={
+                      <button 
+                        onClick={() => {
+                          const sheetData = allTeachers.map(t => {
+                            const monthAtt = attendance.filter(a => a.teacherId === t.uid && isSameMonth(parseISO(a.date), new Date())).length;
+                            const totalAtt = attendance.filter(a => a.teacherId === t.uid).length;
+                            return {
+                              'Teacher Name': t.name,
+                              'Mobile': t.mobile,
+                              'Email/ID': t.email,
+                              'Password': t.password || 'PORTAL_LOGIN',
+                              'Monthly Attendance': `${monthAtt}/25`,
+                              'Session Attendance': `${totalAtt}/200`
+                            };
+                          });
+                          const ws = XLSX.utils.json_to_sheet(sheetData);
+                          const wb = XLSX.utils.book_new();
+                          XLSX.utils.book_append_sheet(wb, ws, "Faculty");
+                          XLSX.writeFile(wb, "SSM_Teacher_List.xlsx");
+                        }}
+                        className="bg-white/10 text-white px-6 py-2 rounded-xl font-black text-[10px] tracking-widest flex items-center gap-2 hover:bg-white/20"
+                      >
+                        <Download className="w-4 h-4"/> EXPORT EXCEL
+                      </button>
+                    }
+                  >
+                    <div className="overflow-x-auto">
+                       <table className="w-full">
+                          <thead>
+                            <tr className="text-left text-[10px] font-black text-indigo-400 uppercase tracking-widest border-b-2 border-indigo-50">
+                              <th className="px-6 py-4">Name/ID</th>
+                              <th className="px-6 py-4">Password</th>
+                              <th className="px-6 py-4">Month Attendance</th>
+                              <th className="px-6 py-4">Session Attendance</th>
+                              <th className="px-6 py-4 text-center">Action</th>
+                            </tr>
+                          </thead>
+                          <tbody className="divide-y divide-indigo-50">
+                            {allTeachers.map(t => {
+                              const monthAtt = attendance.filter(a => a.teacherId === t.uid && isSameMonth(parseISO(a.date), new Date())).length;
+                              const totalAtt = attendance.filter(a => a.teacherId === t.uid).length;
+                              return (
+                                <tr key={t.uid} className="hover:bg-indigo-50/30 transition-all">
+                                  <td className="px-6 py-4">
+                                     <p className="font-black text-indigo-950">{t.name}</p>
+                                     <p className="text-[10px] text-gray-400 font-mono">{t.email}</p>
+                                  </td>
+                                  <td className="px-6 py-4 font-mono text-[10px] text-indigo-400 font-black">{t.password || 'SSM_PORTAL'}</td>
+                                  <td className="px-6 py-4">
+                                     <span className="font-black text-indigo-600">{monthAtt}</span> <span className="text-[10px] text-gray-400">/ 25</span>
+                                  </td>
+                                  <td className="px-6 py-4">
+                                     <span className="font-black text-indigo-600">{totalAtt}</span> <span className="text-[10px] text-gray-400">/ 200</span>
+                                  </td>
+                                  <td className="px-6 py-4 text-center">
+                                     <button onClick={async () => { if(confirm(`Delete ${t.name}?`)) await deleteDoc(doc(db, 'users', t.uid)); }} className="text-red-400 hover:text-red-600"><Trash2 className="w-4 h-4"/></button>
+                                  </td>
+                                </tr>
+                              );
+                            })}
+                          </tbody>
+                       </table>
+                    </div>
+                  </Card>
+                </div>
+              )}
+
+              {activeAdminSection === 'students' && (
+                <div className="space-y-6">
+                  <Card title="Student Strength & Presence Records" icon={UserCheck}
+                    headerAction={
+                      <button 
+                        onClick={() => {
+                          const sheetData = studentAttendance.map(sa => ({
+                            Date: sa.date,
+                            Class: sa.class,
+                            'Total Strength': sa.totalStudents,
+                            'Present Today': sa.present,
+                            'Absent Today': sa.absent,
+                            'Uploaded By': sa.recordedByName
+                          }));
+                          const ws = XLSX.utils.json_to_sheet(sheetData);
+                          const wb = XLSX.utils.book_new();
+                          XLSX.utils.book_append_sheet(wb, ws, "Students");
+                          XLSX.writeFile(wb, "Student_Attendance_Archive.xlsx");
+                        }}
+                        className="bg-white/10 text-white px-6 py-2 rounded-xl font-black text-[10px] tracking-widest flex items-center gap-2 hover:bg-white/20"
+                      >
+                        <Download className="w-4 h-4"/> DOWNLOAD ALL CLASS DETAILS
+                      </button>
+                    }
+                  >
+                     <div className="overflow-x-auto">
+                        <table className="w-full">
+                           <thead>
+                              <tr className="text-left text-[10px] font-black text-indigo-400 uppercase tracking-widest border-b-2 border-indigo-50">
+                                 <th className="px-6 py-4">Date</th>
+                                 <th className="px-6 py-4">Class</th>
+                                 <th className="px-6 py-4">Strength</th>
+                                 <th className="px-6 py-4">Present / Absent</th>
+                                 <th className="px-6 py-4">Class Teacher</th>
+                              </tr>
+                           </thead>
+                           <tbody className="divide-y divide-indigo-50">
+                              {studentAttendance.sort((a,b) => b.date.localeCompare(a.date)).map(sa => (
+                                <tr key={sa.id} className="hover:bg-indigo-50/20">
+                                   <td className="px-6 py-4 text-xs font-bold text-gray-500">{format(parseISO(sa.date), 'dd MMM yyyy')}</td>
+                                   <td className="px-6 py-4 font-black text-indigo-900">{sa.class}</td>
+                                   <td className="px-6 py-4 text-xs font-bold">{sa.totalStudents}</td>
+                                   <td className="px-6 py-4">
+                                      <div className="flex gap-2 font-black">
+                                         <span className="text-green-600">{sa.present} P</span>
+                                         <span className="text-red-500">{sa.absent} A</span>
+                                      </div>
+                                   </td>
+                                   <td className="px-6 py-4 text-[10px] font-black text-indigo-400">{sa.recordedByName}</td>
+                                </tr>
+                              ))}
+                           </tbody>
+                        </table>
+                     </div>
+                  </Card>
+                </div>
               )}
 
               {activeAdminSection === 'timetable' && <TimetableSection />}
@@ -1151,84 +1691,176 @@ export default function App() {
           )}
 
           {view === 'teacherPortal' && userProfile?.role === 'teacher' && (
-            <motion.div key="teacher" initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="space-y-10">
+            <motion.div key="teacher" initial={{ opacity: 0 }} animate={{ opacity: 1 }} className="space-y-10 pb-20">
                {/* Arrangement Notification */}
-               {arrangements.filter(a => a.date === format(new Date(), 'yyyy-MM-dd')).flatMap(a => a.absentTeachers).flatMap(at => at.substitutions).filter(s => s.substituteId === user.uid).length > 0 && (
-                 <div className="bg-gradient-to-r from-orange-600 to-red-600 p-8 rounded-[2.5rem] text-white shadow-2xl shadow-orange-200 relative overflow-hidden">
+               {arrangements.filter(a => a.date === format(new Date(), 'yyyy-MM-dd')).flatMap(a => a.substitutions).filter(s => s.substituteId === user.uid).length > 0 && (
+                 <div className="bg-gradient-to-r from-red-600 via-orange-600 to-red-600 p-10 rounded-[3rem] text-white shadow-2xl shadow-red-200 relative overflow-hidden border-4 border-white">
                    <div className="relative z-10">
-                     <div className="flex items-center gap-4 mb-4">
-                       <AlertCircle className="w-10 h-10 animate-pulse text-white" />
-                       <h3 className="text-3xl font-black italic tracking-tighter">URGENT: ARRANGEMENT ASSIGNED</h3>
+                     <div className="flex items-center gap-6 mb-6">
+                       <div className="w-16 h-16 bg-white/20 rounded-full flex items-center justify-center backdrop-blur-xl">
+                          <AlertCircle className="w-10 h-10 text-white animate-bounce" />
+                       </div>
+                       <div>
+                          <h3 className="text-4xl font-black italic tracking-tighter uppercase leading-none">Emergency Arrangement</h3>
+                          <p className="text-lg font-bold opacity-80 mt-2">Substitution assigned for your free periods today</p>
+                       </div>
                      </div>
-                     <p className="text-lg font-bold opacity-90 mb-6">You have been assigned substitutions for today. Please check the schedule below:</p>
-                     <div className="flex flex-wrap gap-4">
-                        {arrangements.filter(a => a.date === format(new Date(), 'yyyy-MM-dd')).flatMap(a => a.absentTeachers).flatMap(at => at.substitutions).filter(s => s.substituteId === user.uid).map((s, idx) => (
-                          <div key={idx} className="bg-white/20 backdrop-blur-md px-6 py-4 rounded-2xl border border-white/30">
-                            <span className="block text-[10px] font-black uppercase opacity-70">Bell {s.bell}</span>
-                            <span className="text-xl font-bold">Class {s.class}</span>
-                          </div>
+                     <div className="grid grid-cols-1 sm:grid-cols-2 lg:grid-cols-3 gap-6">
+                        {arrangements.filter(a => a.date === format(new Date(), 'yyyy-MM-dd')).flatMap(a => a.substitutions).filter(s => s.substituteId === user.uid).map((s, idx) => (
+                           <div key={idx} className="bg-black/20 backdrop-blur-xl p-6 rounded-[2rem] border border-white/20 hover:bg-black/30 transition-all">
+                             <div className="flex justify-between items-center mb-2">
+                                <span className="text-[10px] font-black uppercase tracking-widest opacity-60">Bell {s.period}</span>
+                                <Sparkles className="w-4 h-4 text-orange-300" />
+                             </div>
+                             <p className="text-3xl font-black uppercase leading-tight italic">{s.class}</p>
+                             <p className="text-xs font-bold opacity-70 mt-1 uppercase tracking-widest">{s.subject}</p>
+                           </div>
                         ))}
                      </div>
                    </div>
-                   <Sparkles className="absolute -right-10 -bottom-10 w-48 h-48 opacity-20 rotate-12" />
+                   <div className="absolute top-0 right-0 -translate-y-1/2 translate-x-1/2 w-64 h-64 bg-white/10 rounded-full blur-3xl"></div>
                  </div>
                )}
 
-               {/* Simplified Teacher View */}
-               <div className="grid md:grid-cols-2 gap-8">
-                  <Card title="Attendance Check-In" icon={CalendarCheck}>
-                     {!attendance.some(a => a.teacherId === user.uid && a.date === format(new Date(), 'yyyy-MM-dd')) ? (
-                       <div className="text-center py-6">
-                          <p className="text-gray-400 text-sm mb-6">Enter code provided by Admin to mark present.</p>
-                          <input 
-                            id="att-code" type="text" placeholder="CODE" 
-                            className="w-full p-4 bg-gray-50 border rounded-2xl text-center text-2xl font-black mb-4 focus:border-indigo-600 outline-none transition-all uppercase"
-                          />
+               {/* Student Attendance Marker (Class Teacher Logic) */}
+               {(() => {
+                  const todayName = format(new Date(), 'EEEE');
+                  const firstBellLesson = timetable.find(tt => tt.teacherId === user.uid && tt.day === todayName && tt.bell === 1);
+                  if (firstBellLesson) {
+                    const cls = `${firstBellLesson.class}${firstBellLesson.section}`;
+                    const alreadyMarked = studentAttendance.some(sa => sa.class === cls && sa.date === format(new Date(), 'yyyy-MM-dd'));
+                    
+                    return (
+                      <Card 
+                        title={`Student Attendance - Class ${cls}`} 
+                        icon={UserCheck}
+                        className="bg-indigo-900 border-none"
+                      >
+                         {!alreadyMarked ? (
+                           <form onSubmit={async (e) => {
+                             e.preventDefault();
+                             const form = e.target as HTMLFormElement;
+                             const strength = parseInt((form.elements.namedItem('strength') as HTMLInputElement).value);
+                             const present = parseInt((form.elements.namedItem('present') as HTMLInputElement).value);
+                             const absent = strength - present;
+
+                             await addDoc(collection(db, 'studentAttendance'), {
+                               date: format(new Date(), 'yyyy-MM-dd'),
+                               class: cls,
+                               totalStudents: strength,
+                               present,
+                               absent,
+                               recordedBy: user.uid,
+                               recordedByName: userProfile.name
+                             });
+                             alert("Student attendance recorded!");
+                           }} className="grid md:grid-cols-3 gap-6 items-end text-white">
+                              <div className="space-y-2">
+                                 <label className="text-[10px] font-black text-indigo-300 uppercase ml-2 tracking-widest">Total Students</label>
+                                 <input name="strength" type="number" required placeholder="0" className="w-full px-6 py-4 bg-white/10 border border-white/20 rounded-2xl outline-none focus:border-white text-white font-black text-xl" />
+                              </div>
+                              <div className="space-y-2">
+                                 <label className="text-[10px] font-black text-indigo-300 uppercase ml-2 tracking-widest">Present Today</label>
+                                 <input name="present" type="number" required placeholder="0" className="w-full px-6 py-4 bg-white/10 border border-white/20 rounded-2xl outline-none focus:border-white text-white font-black text-xl" />
+                              </div>
+                              <button type="submit" className="bg-white text-indigo-600 font-black py-4 rounded-2xl shadow-2xl hover:bg-gray-100 transition-all uppercase tracking-widest text-xs">
+                                Upload Data
+                              </button>
+                           </form>
+                         ) : (
+                           <div className="flex items-center gap-6 text-white py-4">
+                              <CheckCircle2 className="w-12 h-12 text-green-400" />
+                              <div>
+                                 <p className="text-2xl font-black italic tracking-tighter">Attendance Recorded Successfully</p>
+                                 <p className="text-xs font-bold opacity-60 uppercase tracking-widest">Your class attendance for {cls} is now live on Admin Dashboard</p>
+                              </div>
+                           </div>
+                         )}
+                      </Card>
+                    );
+                  }
+                  return null;
+               })()}
+
+               {/* Teacher Dashboard View */}
+               <div className="grid md:grid-cols-2 lg:grid-cols-3 gap-8">
+                  <Card title="Attendance Panel" icon={CalendarCheck}>
+                     <div className="space-y-6">
+                       <div className="bg-gray-50 p-4 rounded-2xl border border-gray-100">
+                          <p className="text-[10px] font-black text-indigo-400 uppercase mb-3">Mark Attendance</p>
+                          {!attendance.some(a => a.teacherId === user.uid && a.date === format(new Date(), 'yyyy-MM-dd')) ? (
+                             <div className="space-y-3">
+                               <input 
+                                 id="att-code" type="text" placeholder="ENTER CODE" 
+                                 className="w-full p-4 bg-white border border-indigo-50 rounded-2xl text-center text-xl font-black focus:border-indigo-600 outline-none transition-all uppercase"
+                               />
+                               <button 
+                                 onClick={async () => {
+                                   const code = (document.getElementById('att-code') as HTMLInputElement).value;
+                                   if (code === attendanceCode) {
+                                     await addDoc(collection(db, 'attendance'), {
+                                       teacherId: user.uid,
+                                       teacherName: userProfile.name,
+                                       date: format(new Date(), 'yyyy-MM-dd'),
+                                       timestamp: serverTimestamp()
+                                     });
+                                     alert("Present Marked!");
+                                   } else {
+                                     alert("Invalid Code!");
+                                   }
+                                 }}
+                                 className="w-full bg-indigo-600 text-white py-3 rounded-xl font-black text-xs shadow-lg shadow-indigo-100 uppercase"
+                               >MARK PRESENT</button>
+                             </div>
+                          ) : (
+                             <div className="bg-green-50 p-4 rounded-xl flex items-center gap-3">
+                                <CheckCircle2 className="w-5 h-5 text-green-600" />
+                                <span className="text-xs font-black text-green-700">PRESENT TODAY</span>
+                             </div>
+                          )}
+                       </div>
+
+                       <div className="bg-indigo-50 p-4 rounded-2xl border border-indigo-100">
+                          <p className="text-[10px] font-black text-indigo-400 uppercase mb-3">Previous Records</p>
                           <button 
-                            onClick={async () => {
-                              const code = (document.getElementById('att-code') as HTMLInputElement).value;
-                              if (code === attendanceCode) {
-                                await addDoc(collection(db, 'attendance'), {
-                                  teacherId: user.uid,
-                                  teacherName: userProfile.name,
-                                  date: format(new Date(), 'yyyy-MM-dd'),
-                                  timestamp: serverTimestamp()
-                                });
-                                alert("Present Marked!");
-                              } else {
-                                alert("Invalid Code!");
-                              }
-                            }}
-                            className="w-full bg-indigo-600 text-white py-4 rounded-2xl font-black text-sm shadow-xl shadow-indigo-200"
-                          >MARK PRESENT</button>
+                            onClick={exportTeacherAttendance}
+                            className="w-full bg-white text-indigo-600 border border-indigo-200 py-3 rounded-xl font-black text-xs hover:bg-indigo-600 hover:text-white transition-all uppercase flex items-center justify-center gap-2"
+                          >
+                             <Download className="w-4 h-4" /> Export Attendance (Excel)
+                          </button>
+                          <p className="text-[9px] text-gray-400 font-bold mt-2 text-center uppercase">Current Session: {new Date().getFullYear()}-{ (new Date().getFullYear() + 1).toString().slice(-2) }</p>
                        </div>
-                     ) : (
-                       <div className="text-center py-10">
-                          <CheckCircle2 className="w-16 h-16 text-green-500 mx-auto mb-4" />
-                          <h4 className="text-2xl font-black text-indigo-950">PRESENT TODAY</h4>
-                          <p className="text-gray-400 text-xs font-bold uppercase mt-1 tracking-widest">{format(new Date(), 'dd MMMM yyyy')}</p>
-                       </div>
-                     )}
+                     </div>
                   </Card>
 
                   <Card title="Apply for Leave" icon={FileText}>
-                    {/* Simplified Leave Form */}
                     <div className="space-y-4">
                        <div className="grid grid-cols-2 gap-4">
-                         <input type="date" id="l-start" className="p-3 bg-gray-50 border rounded-xl text-xs outline-none focus:border-indigo-600 transition-all"/>
-                         <input type="date" id="l-end" className="p-3 bg-gray-50 border rounded-xl text-xs outline-none focus:border-indigo-600 transition-all"/>
+                         <div className="space-y-1">
+                           <label className="text-[9px] font-black text-gray-400 uppercase ml-1">From</label>
+                           <input type="date" id="l-start" className="w-full p-3 bg-gray-50 border rounded-xl text-xs outline-none focus:border-indigo-600 transition-all"/>
+                         </div>
+                         <div className="space-y-1">
+                           <label className="text-[9px] font-black text-gray-400 uppercase ml-1">To</label>
+                           <input type="date" id="l-end" className="w-full p-3 bg-gray-50 border rounded-xl text-xs outline-none focus:border-indigo-600 transition-all"/>
+                         </div>
+                       </div>
+                       <div className="space-y-1">
+                         <label className="text-[9px] font-black text-gray-400 uppercase ml-1">Mobile No.</label>
+                         <input type="tel" id="l-mobile" defaultValue={userProfile.mobile} className="w-full p-3 bg-gray-50 border rounded-xl text-xs outline-none focus:border-indigo-600 transition-all font-bold"/>
                        </div>
                        <textarea id="l-reason" placeholder="Reason for leave..." className="w-full p-4 bg-gray-50 border rounded-2xl text-xs h-24 outline-none focus:border-indigo-600 transition-all"></textarea>
                        <button 
                         onClick={async () => {
                           const start = (document.getElementById('l-start') as HTMLInputElement).value;
                           const end = (document.getElementById('l-end') as HTMLInputElement).value;
+                          const mobile = (document.getElementById('l-mobile') as HTMLInputElement).value;
                           const reason = (document.getElementById('l-reason') as HTMLInputElement).value;
-                          if (start && end && reason) {
+                          if (start && end && reason && mobile) {
                             await addDoc(collection(db, 'leaves'), {
                               teacherId: user.uid,
                               teacherName: userProfile.name,
-                              mobile: userProfile.mobile,
+                              mobile,
                               startDate: start,
                               endDate: end,
                               reason,
@@ -1236,11 +1868,41 @@ export default function App() {
                             });
                             alert("Request Sent!");
                             (document.getElementById('l-reason') as HTMLTextAreaElement).value = '';
+                          } else {
+                            alert("Please fill all fields.");
                           }
                         }}
-                        className="w-full bg-indigo-100 text-indigo-600 py-4 rounded-2xl font-black text-xs hover:bg-indigo-600 hover:text-white transition-all uppercase tracking-widest"
-                       >REQUEST APPROVAL</button>
+                        className="w-full bg-indigo-600 text-white py-4 rounded-2xl font-black text-xs hover:bg-indigo-700 transition-all uppercase tracking-widest shadow-xl shadow-indigo-100"
+                       >SUBMIT APPLICATION</button>
                     </div>
+                  </Card>
+
+                  <Card title="My Time Table" icon={Clock}>
+                     <div className="space-y-4 max-h-[400px] overflow-y-auto pr-2">
+                       {['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'].map(day => {
+                         const dayEntries = timetable.filter(t => t.teacherId === user.uid && t.day === day).sort((a,b) => a.bell - b.bell);
+                         if (dayEntries.length === 0) return null;
+                         return (
+                           <div key={day} className="bg-gray-50 p-4 rounded-2xl border border-gray-100">
+                              <h6 className="text-[10px] font-black text-indigo-600 uppercase mb-3 border-b border-indigo-100 pb-1">{day}</h6>
+                              <div className="space-y-2">
+                                 {dayEntries.map(entry => (
+                                   <div key={entry.bell} className="bg-white p-2 rounded-xl text-[10px] flex justify-between items-center border border-indigo-50">
+                                      <span className="font-black text-gray-400 uppercase">Bell {entry.bell}</span>
+                                      <span className="font-bold text-indigo-700">Class {entry.class}{entry.section} • {entry.subject}</span>
+                                   </div>
+                                 ))}
+                              </div>
+                           </div>
+                         );
+                       })}
+                       {timetable.filter(t => t.teacherId === user.uid).length === 0 && (
+                         <div className="text-center py-10 opacity-40">
+                            <Clock className="w-10 h-10 mx-auto mb-2" />
+                            <p className="text-[10px] font-black uppercase">No schedule assigned yet</p>
+                         </div>
+                       )}
+                     </div>
                   </Card>
                </div>
             </motion.div>
@@ -1248,5 +1910,6 @@ export default function App() {
         </AnimatePresence>
       </div>
     </div>
+    </ErrorBoundary>
   );
 }
