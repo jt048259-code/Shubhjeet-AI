@@ -41,6 +41,7 @@ import {
   doc,
   getDoc,
   setDoc,
+  deleteDoc,
   Timestamp,
   orderBy,
   limit
@@ -56,11 +57,19 @@ import {
   eachDayOfInterval, 
   addMonths, 
   subMonths,
+  subDays,
+  addDays,
   isSameDay,
   isPast,
   isToday,
   getDay
 } from 'date-fns';
+import { 
+  generateTimetableAI, 
+  suggestSubstitutionAI, 
+  TimetableEntry, 
+  SubjectRequirement 
+} from './services/geminiService';
 
 // --- Types ---
 type Role = 'teacher' | 'admin' | null;
@@ -73,7 +82,34 @@ interface UserProfile {
   mobile?: string;
   classes?: string[];
   subjects?: string[];
+  password?: string; // Storing for admin view as requested
   createdAt?: any;
+}
+
+interface Arrangement {
+  id?: string;
+  date: string;
+  absentTeachers: {
+    teacherId: string;
+    teacherName: string;
+    substitutions: {
+      bell: number;
+      class: string;
+      substituteId: string;
+      substituteName: string;
+    }[];
+  }[];
+}
+
+interface StudentAttendance {
+  id?: string;
+  date: string;
+  class: string;
+  teacherId: string;
+  teacherName: string;
+  totalStudents: number;
+  present: number;
+  absent: number;
 }
 
 interface AttendanceRecord {
@@ -203,10 +239,47 @@ export default function App() {
   const [attendance, setAttendance] = useState<AttendanceRecord[]>([]);
   const [schoolSettings, setSchoolSettings] = useState<{ subjects: string[], classes: string[] }>({ subjects: [], classes: [] });
   const [activeTeacherSection, setActiveTeacherSection] = useState<string | null>(null);
+  const [studentAttForm, setStudentAttForm] = useState({ class: '', total: 0, present: 0, absent: 0 });
+
+  const isClassTeacherOf = (cls: string) => {
+    return fullTimetable.some(t => t.teacherId === user?.uid && t.class === cls && t.bell === 1);
+  };
+
+  const getMySubstitutionsToday = () => {
+    const todayStr = format(new Date(), 'yyyy-MM-dd');
+    const todayArr = arrangements.find(a => a.date === todayStr);
+    if (!todayArr) return [];
+    return todayArr.absentTeachers.flatMap(at => 
+      at.substitutions.filter(s => s.substituteId === user?.uid).map(s => ({ ...s, absentTeacherName: at.teacherName }))
+    );
+  };
   const [currentMonth, setCurrentMonth] = useState(new Date());
   const [allTeachers, setAllTeachers] = useState<UserProfile[]>([]);
   const [allAttendance, setAllAttendance] = useState<AttendanceRecord[]>([]);
   const [allLeaves, setAllLeaves] = useState<LeaveRequest[]>([]);
+  const [fullTimetable, setFullTimetable] = useState<TimetableEntry[]>([]);
+  const [subjectRequirements, setSubjectRequirements] = useState<SubjectRequirement[]>([]);
+  const [isGeneratingAI, setIsGeneratingAI] = useState(false);
+  const [substitutionSuggestions, setSubstitutionSuggestions] = useState<any[]>([]);
+  const [loadingAI, setLoadingAI] = useState(false);
+  const [arrangements, setArrangements] = useState<Arrangement[]>([]);
+  const [studentAttendance, setStudentAttendance] = useState<StudentAttendance[]>([]);
+  const [arrangementDate, setArrangementDate] = useState(new Date());
+  const [activeAdminSection, setActiveAdminSection] = useState<string | null>(null);
+  const [activeArrangementSubSection, setActiveArrangementSubSection] = useState<'view' | 'generate' | 'leaves'>('generate');
+
+  const handleFirestoreError = (error: any, operation: string, path: string) => {
+    const errInfo = {
+      error: error.message || String(error),
+      operation,
+      path,
+      auth: {
+        uid: user?.uid,
+        email: user?.email,
+      }
+    };
+    console.error(`Firestore Error [${operation}] on ${path}:`, JSON.stringify(errInfo));
+  };
   
   // Form states
   const [teacherAuth, setTeacherAuth] = useState({ id: '', pass: '' });
@@ -282,7 +355,7 @@ export default function App() {
         };
         setSchoolSettings(defaults);
       }
-    }, (err) => console.error("Settings error:", err));
+    }, (err) => handleFirestoreError(err, 'GET', 'settings/school'));
 
     return () => unsubSettings();
   }, []);
@@ -295,37 +368,84 @@ export default function App() {
     let unsubAttendance: any;
     let unsubCode: any;
     let unsubTeachers: any;
+    let unsubTimetable: any;
+    let unsubRequirements: any;
+    let unsubArrangements: any;
+    let unsubStudentAtt: any;
 
     if (userProfile.role === 'admin') {
       unsubLeaves = onSnapshot(collection(db, 'leaves'), (snap) => {
         const data = snap.docs.map(d => ({ id: d.id, ...d.data() } as LeaveRequest));
+        // Auto-reject expired leaves
+        const today = format(new Date(), 'yyyy-MM-dd');
+        data.forEach(async (l) => {
+          if (l.status === 'pending' && l.startDate < today) {
+            await setDoc(doc(db, 'leaves', l.id), { ...l, status: 'rejected' });
+          }
+        });
         setLeaves(data);
         setAllLeaves(data);
-      }, (err) => console.error("Leaves error:", err));
+      }, (err) => handleFirestoreError(err, 'LIST', 'leaves'));
       
       unsubAttendance = onSnapshot(collection(db, 'attendance'), (snap) => {
         const data = snap.docs.map(d => ({ id: d.id, ...d.data() } as AttendanceRecord));
         setAttendance(data);
         setAllAttendance(data);
-      }, (err) => console.error("Attendance error:", err));
+      }, (err) => handleFirestoreError(err, 'LIST', 'attendance'));
 
       unsubTeachers = onSnapshot(query(collection(db, 'users'), where('role', '==', 'teacher')), (snap) => {
         setAllTeachers(snap.docs.map(d => ({ uid: d.id, ...d.data() } as UserProfile)));
-      });
+      }, (err) => handleFirestoreError(err, 'LIST', 'users'));
+
+      unsubTimetable = onSnapshot(doc(db, 'settings', 'timetable'), (snap) => {
+        if (snap.exists()) setFullTimetable(snap.data().entries || []);
+      }, (err) => handleFirestoreError(err, 'GET', 'settings/timetable'));
+
+      unsubRequirements = onSnapshot(doc(db, 'settings', 'subjectRequirements'), (snap) => {
+        if (snap.exists()) setSubjectRequirements(snap.data().requirements || []);
+      }, (err) => handleFirestoreError(err, 'GET', 'settings/subjectRequirements'));
+
+      unsubArrangements = onSnapshot(collection(db, 'arrangements'), (snap) => {
+        const data = snap.docs.map(d => ({ id: d.id, ...d.data() } as Arrangement));
+        // Cleanup: Only keep last 2 months
+        const twoMonthsAgo = format(subMonths(new Date(), 2), 'yyyy-MM-dd');
+        data.forEach(async (a) => {
+          if (a.date < twoMonthsAgo && a.id) {
+            await deleteDoc(doc(db, 'arrangements', a.id));
+          }
+        });
+        setArrangements(data);
+      }, (err) => handleFirestoreError(err, 'LIST', 'arrangements'));
+
+      unsubStudentAtt = onSnapshot(collection(db, 'studentAttendance'), (snap) => {
+        setStudentAttendance(snap.docs.map(d => ({ id: d.id, ...d.data() } as StudentAttendance)));
+      }, (err) => handleFirestoreError(err, 'LIST', 'studentAttendance'));
     } else {
       const q = query(collection(db, 'leaves'), where('teacherId', '==', user.uid));
       unsubLeaves = onSnapshot(q, (snap) => {
         const data = snap.docs.map(d => ({ id: d.id, ...d.data() } as LeaveRequest));
         setLeaves(data);
         setAllLeaves(data);
-      }, (err) => console.error("Teacher leaves error:", err));
+      }, (err) => handleFirestoreError(err, 'LIST', 'leaves'));
 
       const qAtt = query(collection(db, 'attendance'), where('teacherId', '==', user.uid));
       unsubAttendance = onSnapshot(qAtt, (snap) => {
         const data = snap.docs.map(d => ({ id: d.id, ...d.data() } as AttendanceRecord));
         setAttendance(data);
         setAllAttendance(data);
-      });
+      }, (err) => handleFirestoreError(err, 'LIST', 'attendance'));
+
+      unsubTimetable = onSnapshot(doc(db, 'settings', 'timetable'), (snap) => {
+        if (snap.exists()) setFullTimetable(snap.data().entries || []);
+      }, (err) => handleFirestoreError(err, 'GET', 'settings/timetable'));
+
+      unsubArrangements = onSnapshot(collection(db, 'arrangements'), (snap) => {
+        setArrangements(snap.docs.map(d => ({ id: d.id, ...d.data() } as Arrangement)));
+      }, (err) => handleFirestoreError(err, 'LIST', 'arrangements'));
+
+      unsubStudentAtt = onSnapshot(collection(db, 'studentAttendance'), (snap) => {
+        setStudentAttendance(snap.docs.map(d => ({ id: d.id, ...d.data() } as StudentAttendance)));
+      }, (err) => handleFirestoreError(err, 'LIST', 'studentAttendance'));
     }
 
     unsubCode = onSnapshot(query(collection(db, 'attendanceCodes'), orderBy('createdAt', 'desc'), limit(1)), (snap) => {
@@ -337,15 +457,192 @@ export default function App() {
           setAttendanceCode(null);
         }
       }
-    }, (err) => console.error("Code error:", err));
+    }, (err) => handleFirestoreError(err, 'LIST', 'attendanceCodes'));
 
     return () => {
       unsubLeaves?.();
       unsubAttendance?.();
       unsubCode?.();
       unsubTeachers?.();
+      unsubTimetable?.();
+      unsubRequirements?.();
+      unsubArrangements?.();
+      unsubStudentAtt?.();
     };
   }, [user, userProfile]);
+
+  const handleGenerateTimetable = async () => {
+    if (subjectRequirements.length === 0) {
+      alert("Please set subject requirements first.");
+      return;
+    }
+    setIsGeneratingAI(true);
+    try {
+      const teachersData = allTeachers.map(t => ({
+        uid: t.uid,
+        name: t.name,
+        subjects: t.subjects || [],
+        classes: t.classes || []
+      }));
+      const entries = await generateTimetableAI(teachersData, subjectRequirements);
+      await setDoc(doc(db, 'settings', 'timetable'), { entries, updatedAt: serverTimestamp() });
+      alert("AI Timetable generated successfully!");
+    } catch (err) {
+      console.error(err);
+      alert("Failed to generate timetable.");
+    } finally {
+      setIsGeneratingAI(false);
+    }
+  };
+
+  const handleAISubstitution = async (leave: LeaveRequest) => {
+    setLoadingAI(true);
+    try {
+      const absentTeacher = allTeachers.find(t => t.uid === leave.teacherId);
+      if (!absentTeacher) return;
+
+      const today = format(new Date(), 'EEEE'); // e.g., 'Monday'
+      const todayTimetable = fullTimetable.filter(t => t.day === today);
+      
+      // Find teachers who are free at each bell the absent teacher was supposed to teach
+      const freeTeachers = allTeachers.filter(t => t.uid !== leave.teacherId);
+      
+      const suggestions = await suggestSubstitutionAI(
+        { name: absentTeacher.name, subjects: absentTeacher.subjects || [], classes: absentTeacher.classes || [] },
+        freeTeachers.map(t => ({ name: t.name, subjects: t.subjects || [], classes: t.classes || [] })),
+        todayTimetable
+      );
+      setSubstitutionSuggestions(suggestions);
+    } catch (err) {
+      console.error(err);
+    } finally {
+      setLoadingAI(false);
+    }
+  };
+
+  const updateRequirement = async (req: SubjectRequirement) => {
+    const newReqs = [...subjectRequirements];
+    const index = newReqs.findIndex(r => r.class === req.class && r.subject === req.subject);
+    if (index > -1) newReqs[index] = req;
+    else newReqs.push(req);
+    await setDoc(doc(db, 'settings', 'subjectRequirements'), { requirements: newReqs });
+  };
+
+  const handleGenerateArrangement = async () => {
+    const todayStr = format(new Date(), 'yyyy-MM-dd');
+    const dayName = format(new Date(), 'EEEE');
+    
+    // 1. Find teachers on approved leave today
+    const absentTeacherIds = allLeaves
+      .filter(l => l.status === 'approved' && todayStr >= l.startDate && todayStr <= l.endDate)
+      .map(l => l.teacherId);
+    
+    if (absentTeacherIds.length === 0) {
+      alert("No teachers are on leave today.");
+      return;
+    }
+
+    const absentTeachersData = allTeachers.filter(t => absentTeacherIds.includes(t.uid));
+    const freeTeachers = allTeachers.filter(t => !absentTeacherIds.includes(t.uid));
+    
+    const newArrangement: Arrangement = {
+      date: todayStr,
+      absentTeachers: []
+    };
+
+    absentTeachersData.forEach(absentTeacher => {
+      const teacherSchedule = fullTimetable.filter(t => t.teacherId === absentTeacher.uid && t.day === dayName);
+      const substitutions: any[] = [];
+
+      [1, 2, 3, 4, 5, 6, 7, 8].forEach(bell => {
+        const entry = teacherSchedule.find(t => t.bell === bell);
+        if (entry) {
+          // Find a free teacher for this bell
+          const substitute = freeTeachers.find(ft => {
+            const ftSchedule = fullTimetable.filter(t => t.teacherId === ft.uid && t.day === dayName);
+            return !ftSchedule.some(t => t.bell === bell);
+          });
+
+          if (substitute) {
+            substitutions.push({
+              bell,
+              class: entry.class,
+              substituteId: substitute.uid,
+              substituteName: substitute.name
+            });
+          } else {
+            substitutions.push({
+              bell,
+              class: entry.class,
+              substituteId: 'N/A',
+              substituteName: 'No Free Teacher'
+            });
+          }
+        }
+      });
+
+      newArrangement.absentTeachers.push({
+        teacherId: absentTeacher.uid,
+        teacherName: absentTeacher.name,
+        substitutions
+      });
+    });
+
+    try {
+      await addDoc(collection(db, 'arrangements'), newArrangement);
+      alert("Arrangement generated successfully!");
+    } catch (err) {
+      console.error(err);
+      alert("Failed to save arrangement.");
+    }
+  };
+
+  const submitStudentAttendance = async (cls: string, total: number, present: number, absent: number) => {
+    if (!user || !userProfile) return;
+    try {
+      await addDoc(collection(db, 'studentAttendance'), {
+        date: format(new Date(), 'yyyy-MM-dd'),
+        class: cls,
+        teacherId: user.uid,
+        teacherName: userProfile.name,
+        totalStudents: total,
+        present,
+        absent,
+        createdAt: serverTimestamp()
+      });
+      alert("Student attendance uploaded successfully!");
+    } catch (err) {
+      console.error(err);
+      alert("Failed to upload student attendance.");
+    }
+  };
+
+  const exportTeacherList = () => {
+    const today = new Date();
+    const monthStart = startOfMonth(today);
+    const sessionStart = new Date(today.getFullYear(), 3, 1); // April 1st
+    if (today < sessionStart) sessionStart.setFullYear(today.getFullYear() - 1);
+
+    const workingDaysMonth = eachDayOfInterval({ start: monthStart, end: today }).filter(d => getDay(d) !== 0).length;
+    const workingDaysSession = eachDayOfInterval({ start: sessionStart, end: today }).filter(d => getDay(d) !== 0).length;
+
+    const data = allTeachers.map(t => {
+      const attMonth = allAttendance.filter(a => a.teacherId === t.uid && a.date >= format(monthStart, 'yyyy-MM-dd')).length;
+      const attSession = allAttendance.filter(a => a.teacherId === t.uid && a.date >= format(sessionStart, 'yyyy-MM-dd')).length;
+      
+      return {
+        'Teacher Name': t.name,
+        'Teacher ID': t.email.split('@')[0],
+        'Password': t.password || 'N/A',
+        'Mobile': t.mobile || 'N/A',
+        'Classes': t.classes?.join(', ') || 'N/A',
+        'Subjects': t.subjects?.join(', ') || 'N/A',
+        'Month Attendance': `${attMonth}/${workingDaysMonth}`,
+        'Session Attendance': `${attSession}/${workingDaysSession}`
+      };
+    });
+    exportToExcel(data, 'Teacher_Database');
+  };
 
   const handleTeacherLogin = async () => {
     try {
@@ -385,6 +682,7 @@ export default function App() {
         mobile: signupForm.mobile,
         classes: signupForm.classes,
         subjects: signupForm.subjects,
+        password: signupForm.pass,
         createdAt: serverTimestamp() as any
       };
       await setDoc(doc(db, 'users', u.uid), profile);
@@ -780,7 +1078,38 @@ export default function App() {
 
           {view === 'teacher-portal' && (
             <motion.div key="teacher" className="space-y-6">
-              <div className="grid md:grid-cols-3 gap-6">
+              {getMySubstitutionsToday().length > 0 && (
+                <motion.div 
+                  initial={{ scale: 0.9, opacity: 0 }} 
+                  animate={{ scale: 1, opacity: 1 }}
+                  className="bg-indigo-600 p-8 rounded-[2rem] text-white shadow-2xl relative overflow-hidden"
+                >
+                  <div className="relative z-10">
+                    <div className="flex items-center gap-4 mb-4">
+                      <div className="bg-white/20 p-3 rounded-2xl backdrop-blur-md">
+                        <Sparkles className="w-8 h-8" />
+                      </div>
+                      <h2 className="text-3xl font-black">Today's Substitution Alert!</h2>
+                    </div>
+                    <p className="text-indigo-100 mb-6 font-medium">You have been assigned as a substitute for the following classes today:</p>
+                    <div className="grid md:grid-cols-2 lg:grid-cols-3 gap-4">
+                      {getMySubstitutionsToday().map((sub, idx) => (
+                        <div key={idx} className="bg-white/10 backdrop-blur-md p-4 rounded-2xl border border-white/20">
+                          <div className="flex justify-between items-center mb-2">
+                            <span className="bg-white text-indigo-600 px-3 py-1 rounded-full text-[10px] font-black uppercase">Bell {sub.bell}</span>
+                            <span className="text-xs font-bold">Class {sub.class}</span>
+                          </div>
+                          <p className="text-sm opacity-80">Substituting for:</p>
+                          <p className="font-bold text-lg">{sub.absentTeacherName}</p>
+                        </div>
+                      ))}
+                    </div>
+                  </div>
+                  <div className="absolute top-0 right-0 w-64 h-64 bg-white/10 rounded-full -mr-32 -mt-32 blur-3xl"></div>
+                </motion.div>
+              )}
+
+              <div className="grid md:grid-cols-4 gap-6">
                 {/* Attendance Box */}
                 <div 
                   onClick={() => setActiveTeacherSection(activeTeacherSection === 'attendance' ? null : 'attendance')}
@@ -810,10 +1139,83 @@ export default function App() {
                   <h3 className="text-2xl font-bold">Time Table</h3>
                   <p className={`text-sm mt-2 ${activeTeacherSection === 'timetable' ? 'text-indigo-100' : 'text-gray-500'}`}>View your schedule</p>
                 </div>
+
+                {/* Student Attendance Box (Only for Class Teachers) */}
+                {schoolSettings.classes.some(cls => isClassTeacherOf(cls)) && (
+                  <div 
+                    onClick={() => setActiveTeacherSection(activeTeacherSection === 'student-attendance' ? null : 'student-attendance')}
+                    className={`p-8 rounded-3xl cursor-pointer transition-all transform hover:scale-105 shadow-sm border-2 ${activeTeacherSection === 'student-attendance' ? 'bg-indigo-600 text-white border-indigo-600' : 'bg-white text-gray-800 border-gray-100'}`}
+                  >
+                    <UserPlus className={`w-12 h-12 mb-4 ${activeTeacherSection === 'student-attendance' ? 'text-white' : 'text-indigo-600'}`} />
+                    <h3 className="text-2xl font-bold">Students</h3>
+                    <p className={`text-sm mt-2 ${activeTeacherSection === 'student-attendance' ? 'text-indigo-100' : 'text-gray-500'}`}>Daily student details</p>
+                  </div>
+                )}
               </div>
 
               {/* Content Area */}
               <AnimatePresence mode="wait">
+                {activeTeacherSection === 'student-attendance' && (
+                  <motion.div initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: 20 }}>
+                    <Card title="Daily Student Attendance Upload" icon={UserPlus}>
+                      <div className="max-w-4xl mx-auto py-6">
+                        <div className="grid md:grid-cols-2 gap-8">
+                          <div className="space-y-6">
+                            <h4 className="text-lg font-bold text-indigo-900">Select Your Class</h4>
+                            <div className="grid grid-cols-2 gap-4">
+                              {schoolSettings.classes.filter(cls => isClassTeacherOf(cls)).map(cls => (
+                                <button 
+                                  key={cls}
+                                  onClick={() => setStudentAttForm({ ...studentAttForm, class: cls })}
+                                  className={`p-6 rounded-3xl border-2 font-black text-xl transition-all ${studentAttForm.class === cls ? 'bg-indigo-600 text-white border-indigo-600 shadow-lg' : 'bg-white text-gray-400 border-gray-100 hover:border-indigo-200'}`}
+                                >
+                                  Class {cls}
+                                </button>
+                              ))}
+                            </div>
+                          </div>
+
+                          {studentAttForm.class && (
+                            <div className="bg-gray-50 p-8 rounded-[2.5rem] border-2 border-white shadow-inner space-y-6">
+                              <h4 className="text-xl font-black text-indigo-900">Attendance for Class {studentAttForm.class}</h4>
+                              <div className="space-y-4">
+                                <div>
+                                  <label className="text-xs font-bold text-gray-500 uppercase ml-2">Total Students</label>
+                                  <input 
+                                    type="number" className="w-full p-4 rounded-2xl border-2 border-white shadow-sm focus:border-indigo-600 outline-none"
+                                    value={studentAttForm.total} onChange={e => setStudentAttForm({ ...studentAttForm, total: parseInt(e.target.value) || 0 })}
+                                  />
+                                </div>
+                                <div className="grid grid-cols-2 gap-4">
+                                  <div>
+                                    <label className="text-xs font-bold text-green-600 uppercase ml-2">Present</label>
+                                    <input 
+                                      type="number" className="w-full p-4 rounded-2xl border-2 border-white shadow-sm focus:border-green-600 outline-none"
+                                      value={studentAttForm.present} onChange={e => setStudentAttForm({ ...studentAttForm, present: parseInt(e.target.value) || 0 })}
+                                    />
+                                  </div>
+                                  <div>
+                                    <label className="text-xs font-bold text-red-600 uppercase ml-2">Absent</label>
+                                    <input 
+                                      type="number" className="w-full p-4 rounded-2xl border-2 border-white shadow-sm focus:border-red-600 outline-none"
+                                      value={studentAttForm.absent} onChange={e => setStudentAttForm({ ...studentAttForm, absent: parseInt(e.target.value) || 0 })}
+                                    />
+                                  </div>
+                                </div>
+                                <button 
+                                  onClick={() => submitStudentAttendance(studentAttForm.class, studentAttForm.total, studentAttForm.present, studentAttForm.absent)}
+                                  className="w-full py-4 bg-indigo-600 text-white rounded-2xl font-black shadow-xl hover:bg-indigo-700 transition-all transform hover:-translate-y-1"
+                                >
+                                  Upload Details
+                                </button>
+                              </div>
+                            </div>
+                          )}
+                        </div>
+                      </div>
+                    </Card>
+                  </motion.div>
+                )}
                 {activeTeacherSection === 'attendance' && (
                   <motion.div initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: 20 }}>
                     <div className="grid lg:grid-cols-3 gap-6">
@@ -890,10 +1292,36 @@ export default function App() {
                 {activeTeacherSection === 'timetable' && (
                   <motion.div initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: 20 }}>
                     <Card title="My Schedule" icon={Clock}>
-                      <div className="p-12 text-center">
-                        <div className="bg-gray-50 rounded-3xl p-12 border-2 border-dashed border-gray-200">
-                          <Calendar className="w-16 h-16 text-gray-300 mx-auto mb-4" />
-                          <p className="text-gray-500 font-medium">Your personalized time table will be generated by the admin soon.</p>
+                      <div className="space-y-6">
+                        <div className="grid grid-cols-7 gap-2 text-center">
+                          <div className="text-[10px] font-black text-gray-400 uppercase">Bell</div>
+                          {['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'].map(d => (
+                            <div key={d} className="text-[10px] font-black text-indigo-900 uppercase">{d}</div>
+                          ))}
+                        </div>
+                        <div className="space-y-2">
+                          {[1, 2, 3, 4, 5, 6].map(bell => (
+                            <div key={bell} className="grid grid-cols-7 gap-2">
+                              <div className="flex items-center justify-center bg-gray-50 rounded-lg border border-gray-100 text-[10px] font-black text-gray-400">
+                                {bell}
+                              </div>
+                              {['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'].map(day => {
+                                const entry = fullTimetable.find(t => t.teacherId === user?.uid && t.day === day && t.bell === bell);
+                                return (
+                                  <div key={day} className={`p-2 rounded-xl border text-[8px] flex flex-col items-center justify-center min-h-[60px] transition-all ${entry ? 'bg-indigo-50 border-indigo-100 shadow-sm' : 'bg-gray-50 border-gray-100 opacity-30'}`}>
+                                    {entry ? (
+                                      <>
+                                        <span className="font-black text-indigo-700 mb-1">Class {entry.class}</span>
+                                        <span className="text-gray-600 text-center leading-tight">{entry.subject}</span>
+                                      </>
+                                    ) : (
+                                      <span className="text-gray-300">--</span>
+                                    )}
+                                  </div>
+                                );
+                              })}
+                            </div>
+                          ))}
                         </div>
                       </div>
                     </Card>
@@ -905,34 +1333,444 @@ export default function App() {
 
           {view === 'admin-portal' && (
             <motion.div key="admin" className="space-y-8">
-              <div className="grid md:grid-cols-4 gap-6">
-                <div className="bg-white p-6 rounded-3xl shadow-sm border border-indigo-100">
-                  <p className="text-gray-500 text-sm mb-1">Active Code</p>
-                  <h2 className="text-4xl font-mono font-black text-indigo-600">{attendanceCode || '------'}</h2>
-                  <button onClick={generateCode} className="mt-4 w-full py-2 bg-indigo-50 text-xs font-bold text-indigo-600 rounded-xl hover:bg-indigo-100 flex items-center justify-center gap-1 transition-all">
-                    <Plus className="w-4 h-4" /> Generate New
-                  </button>
-                </div>
-                <div className="bg-white p-6 rounded-3xl shadow-sm border border-gray-100">
-                  <p className="text-gray-500 text-sm mb-1">Pending Leaves</p>
-                  <h2 className="text-4xl font-black text-gray-800">{leaves.filter(l => l.status === 'pending').length}</h2>
-                  <p className="text-xs text-gray-400 mt-2">Requires immediate action</p>
-                </div>
-                <div className="bg-white p-6 rounded-3xl shadow-sm border border-gray-100">
-                  <p className="text-gray-500 text-sm mb-1">Today's Attendance</p>
-                  <h2 className="text-4xl font-black text-gray-800">{attendance.filter(a => a.date === format(new Date(), 'yyyy-MM-dd')).length}</h2>
-                  <p className="text-xs text-gray-400 mt-2">Teachers present today</p>
-                </div>
-                <div className="bg-white p-6 rounded-3xl shadow-sm border border-gray-100">
-                  <button 
-                    onClick={() => exportToExcel(attendance, 'School_Attendance_Report')}
-                    className="w-full h-full flex flex-col items-center justify-center gap-2 text-indigo-600 font-bold hover:bg-indigo-50 rounded-2xl transition-all"
-                  >
-                    <Download className="w-8 h-8" />
-                    Export Report
-                  </button>
-                </div>
+              <div className="grid grid-cols-2 md:grid-cols-5 gap-4">
+                <button 
+                  onClick={() => setActiveAdminSection(activeAdminSection === 'dashboard' ? null : 'dashboard')}
+                  className={`p-4 rounded-2xl font-bold text-sm flex items-center justify-center gap-2 transition-all ${activeAdminSection === 'dashboard' || !activeAdminSection ? 'bg-indigo-600 text-white shadow-lg' : 'bg-white text-indigo-600 border-2 border-indigo-50 hover:bg-indigo-50'}`}
+                >
+                  <LayoutDashboard className="w-5 h-5" /> Dashboard
+                </button>
+                <button 
+                  onClick={() => setActiveAdminSection(activeAdminSection === 'arrangement' ? null : 'arrangement')}
+                  className={`p-4 rounded-2xl font-bold text-sm flex items-center justify-center gap-2 transition-all ${activeAdminSection === 'arrangement' ? 'bg-indigo-600 text-white shadow-lg' : 'bg-white text-indigo-600 border-2 border-indigo-50 hover:bg-indigo-50'}`}
+                >
+                  <Calendar className="w-5 h-5" /> Arrangement
+                </button>
+                <button 
+                  onClick={() => setActiveAdminSection(activeAdminSection === 'teachers' ? null : 'teachers')}
+                  className={`p-4 rounded-2xl font-bold text-sm flex items-center justify-center gap-2 transition-all ${activeAdminSection === 'teachers' ? 'bg-indigo-600 text-white shadow-lg' : 'bg-white text-indigo-600 border-2 border-indigo-50 hover:bg-indigo-50'}`}
+                >
+                  <Users className="w-5 h-5" /> Teacher List
+                </button>
+                <button 
+                  onClick={() => setActiveAdminSection(activeAdminSection === 'students' ? null : 'students')}
+                  className={`p-4 rounded-2xl font-bold text-sm flex items-center justify-center gap-2 transition-all ${activeAdminSection === 'students' ? 'bg-indigo-600 text-white shadow-lg' : 'bg-white text-indigo-600 border-2 border-indigo-50 hover:bg-indigo-50'}`}
+                >
+                  <UserPlus className="w-5 h-5" /> Students Present
+                </button>
+                <button 
+                  onClick={() => setActiveAdminSection(activeAdminSection === 'timetable' ? null : 'timetable')}
+                  className={`p-4 rounded-2xl font-bold text-sm flex items-center justify-center gap-2 transition-all ${activeAdminSection === 'timetable' ? 'bg-indigo-600 text-white shadow-lg' : 'bg-white text-indigo-600 border-2 border-indigo-50 hover:bg-indigo-50'}`}
+                >
+                  <Clock className="w-5 h-5" /> Time Table
+                </button>
               </div>
+
+              <AnimatePresence mode="wait">
+                {(activeAdminSection === 'dashboard' || !activeAdminSection) && (
+                  <motion.div initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: 20 }} className="space-y-8">
+                    <div className="grid md:grid-cols-4 gap-6">
+                      <div className="bg-white p-6 rounded-3xl shadow-sm border border-indigo-100">
+                        <p className="text-gray-500 text-sm mb-1">Active Code</p>
+                        <h2 className="text-4xl font-mono font-black text-indigo-600">{attendanceCode || '------'}</h2>
+                        <button onClick={generateCode} className="mt-4 w-full py-2 bg-indigo-50 text-xs font-bold text-indigo-600 rounded-xl hover:bg-indigo-100 flex items-center justify-center gap-1 transition-all">
+                          <Plus className="w-4 h-4" /> Generate New
+                        </button>
+                      </div>
+                      <div className="bg-white p-6 rounded-3xl shadow-sm border border-gray-100">
+                        <p className="text-gray-500 text-sm mb-1">Pending Leaves</p>
+                        <h2 className="text-4xl font-black text-gray-800">{leaves.filter(l => l.status === 'pending').length}</h2>
+                        <p className="text-xs text-gray-400 mt-2">Requires immediate action</p>
+                      </div>
+                      <div className="bg-white p-6 rounded-3xl shadow-sm border border-gray-100">
+                        <p className="text-gray-500 text-sm mb-1">Today's Attendance</p>
+                        <h2 className="text-4xl font-black text-gray-800">{attendance.filter(a => a.date === format(new Date(), 'yyyy-MM-dd')).length}</h2>
+                        <p className="text-xs text-gray-400 mt-2">Teachers present today</p>
+                      </div>
+                      <div className="bg-white p-6 rounded-3xl shadow-sm border border-gray-100">
+                        <button 
+                          onClick={() => exportToExcel(attendance, 'School_Attendance_Report')}
+                          className="w-full h-full flex flex-col items-center justify-center gap-2 text-indigo-600 font-bold hover:bg-indigo-50 rounded-2xl transition-all"
+                        >
+                          <Download className="w-8 h-8" />
+                          Export Report
+                        </button>
+                      </div>
+                    </div>
+
+                    <Card title="School Settings" icon={Settings}>
+                      <div className="grid md:grid-cols-2 gap-8 py-4">
+                        <div className="space-y-4">
+                          <h4 className="text-sm font-bold text-gray-500 uppercase">Manage Subjects</h4>
+                          <div className="flex flex-wrap gap-2">
+                            {schoolSettings.subjects.map(s => (
+                              <span key={s} className="px-3 py-1 bg-indigo-50 text-indigo-600 rounded-full text-xs font-bold flex items-center gap-2">
+                                {s} <X className="w-3 h-3 cursor-pointer" onClick={() => setSchoolSettings({...schoolSettings, subjects: schoolSettings.subjects.filter(sub => sub !== s)})} />
+                              </span>
+                            ))}
+                            <button className="px-3 py-1 border-2 border-dashed border-indigo-200 text-indigo-400 rounded-full text-xs font-bold hover:border-indigo-400 hover:text-indigo-600 transition-all">+ Add</button>
+                          </div>
+                        </div>
+                        <div className="space-y-4">
+                          <h4 className="text-sm font-bold text-gray-500 uppercase">Manage Classes</h4>
+                          <div className="flex flex-wrap gap-2">
+                            {schoolSettings.classes.map(c => (
+                              <span key={c} className="px-3 py-1 bg-green-50 text-green-600 rounded-full text-xs font-bold flex items-center gap-2">
+                                Class {c} <X className="w-3 h-3 cursor-pointer" onClick={() => setSchoolSettings({...schoolSettings, classes: schoolSettings.classes.filter(cls => cls !== c)})} />
+                              </span>
+                            ))}
+                            <button className="px-3 py-1 border-2 border-dashed border-green-200 text-green-400 rounded-full text-xs font-bold hover:border-green-400 hover:text-green-600 transition-all">+ Add</button>
+                          </div>
+                        </div>
+                      </div>
+                    </Card>
+                  </motion.div>
+                )}
+                {activeAdminSection === 'arrangement' && (
+                  <motion.div initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: 20 }} className="space-y-6">
+                    <div className="flex flex-wrap gap-4 mb-6">
+                      <button 
+                        onClick={() => setActiveArrangementSubSection('view')}
+                        className={`px-6 py-3 rounded-2xl font-black text-sm transition-all ${activeArrangementSubSection === 'view' ? 'bg-indigo-600 text-white shadow-lg' : 'bg-white text-indigo-600 border-2 border-indigo-50 hover:bg-indigo-50'}`}
+                      >
+                        View Previous Arrangement
+                      </button>
+                      <button 
+                        onClick={() => setActiveArrangementSubSection('generate')}
+                        className={`px-6 py-3 rounded-2xl font-black text-sm transition-all ${activeArrangementSubSection === 'generate' ? 'bg-indigo-600 text-white shadow-lg' : 'bg-white text-indigo-600 border-2 border-indigo-50 hover:bg-indigo-50'}`}
+                      >
+                        Generate/View Today
+                      </button>
+                      <button 
+                        onClick={() => setActiveArrangementSubSection('leaves')}
+                        className={`px-6 py-3 rounded-2xl font-black text-sm transition-all ${activeArrangementSubSection === 'leaves' ? 'bg-indigo-600 text-white shadow-lg' : 'bg-white text-indigo-600 border-2 border-indigo-50 hover:bg-indigo-50'}`}
+                      >
+                        View Leave Requests
+                      </button>
+                    </div>
+
+                    {activeArrangementSubSection === 'view' && (
+                      <Card title="Previous Arrangements" icon={Calendar}>
+                        <div className="grid md:grid-cols-3 gap-4 mb-8">
+                          <button 
+                            onClick={() => setArrangementDate(subDays(arrangementDate, 1))}
+                            className="p-4 bg-gray-50 rounded-2xl text-sm font-bold hover:bg-gray-100 flex flex-col items-center gap-2"
+                          >
+                            <ChevronLeft className="w-6 h-6 text-indigo-600" />
+                            Previous Day
+                          </button>
+                          <div className="p-4 bg-indigo-600 text-white rounded-2xl text-center flex flex-col justify-center">
+                            <p className="text-[10px] font-bold opacity-80 uppercase">{format(arrangementDate, 'EEEE')}</p>
+                            <p className="text-xl font-black">{format(arrangementDate, 'dd MMM yyyy')}</p>
+                          </div>
+                          <button 
+                            onClick={() => setArrangementDate(addDays(arrangementDate, 1))}
+                            className="p-4 bg-gray-50 rounded-2xl text-sm font-bold hover:bg-gray-100 flex flex-col items-center gap-2"
+                          >
+                            <ChevronRight className="w-6 h-6 text-indigo-600" />
+                            Next Day
+                          </button>
+                        </div>
+
+                        <div className="grid md:grid-cols-2 lg:grid-cols-3 gap-6">
+                          {arrangements.filter(a => a.date === format(arrangementDate, 'yyyy-MM-dd')).flatMap(a => a.absentTeachers).map((at, idx) => (
+                            <div key={idx} className="bg-white border-2 border-indigo-50 rounded-3xl p-6 shadow-sm">
+                              <div className="flex items-center gap-3 mb-4 border-b pb-4">
+                                <div className="w-10 h-10 bg-red-50 rounded-full flex items-center justify-center text-red-600">
+                                  <UserX className="w-5 h-5" />
+                                </div>
+                                <div>
+                                  <p className="text-[10px] font-bold text-gray-400 uppercase">Absent Teacher</p>
+                                  <h5 className="font-black text-indigo-950">{at.teacherName}</h5>
+                                </div>
+                              </div>
+                              <table className="w-full text-[10px]">
+                                <thead>
+                                  <tr className="text-gray-400 border-b">
+                                    <th className="pb-2 text-left">Bell</th>
+                                    <th className="pb-2 text-left">Class</th>
+                                    <th className="pb-2 text-left">Substitute</th>
+                                  </tr>
+                                </thead>
+                                <tbody>
+                                  {at.substitutions.map((s, i) => (
+                                    <tr key={i} className="border-b last:border-0">
+                                      <td className="py-2 font-bold text-indigo-600">{s.bell}</td>
+                                      <td className="py-2 font-medium">{s.class}</td>
+                                      <td className="py-2 font-black text-gray-700">{s.substituteName}</td>
+                                    </tr>
+                                  ))}
+                                </tbody>
+                              </table>
+                            </div>
+                          ))}
+                          {arrangements.filter(a => a.date === format(arrangementDate, 'yyyy-MM-dd')).length === 0 && (
+                            <div className="col-span-full py-12 text-center text-gray-400 bg-gray-50 rounded-3xl border-2 border-dashed">
+                              <Calendar className="w-12 h-12 mx-auto mb-4 opacity-20" />
+                              <p>No arrangements found for this date.</p>
+                            </div>
+                          )}
+                        </div>
+                      </Card>
+                    )}
+
+                    {activeArrangementSubSection === 'generate' && (
+                      <Card title="Today's Arrangement" icon={Sparkles}>
+                        <div className="space-y-6">
+                          <div className="flex justify-between items-center">
+                            <h4 className="font-bold text-indigo-900">Today: {format(new Date(), 'dd MMM yyyy')}</h4>
+                            {arrangements.some(a => a.date === format(new Date(), 'yyyy-MM-dd')) ? (
+                              <span className="bg-green-100 text-green-600 px-4 py-2 rounded-xl font-bold text-xs flex items-center gap-2">
+                                <ShieldCheck className="w-4 h-4" /> Already Generated
+                              </span>
+                            ) : (
+                              <button 
+                                onClick={handleGenerateArrangement}
+                                className="bg-indigo-600 text-white px-6 py-2 rounded-xl font-bold text-sm hover:bg-indigo-700 shadow-md flex items-center gap-2"
+                              >
+                                <Sparkles className="w-4 h-4" /> Generate Today's Arrangement
+                              </button>
+                            )
+                          }
+                          </div>
+
+                          <div className="grid md:grid-cols-2 lg:grid-cols-3 gap-6">
+                            {arrangements.filter(a => a.date === format(new Date(), 'yyyy-MM-dd')).flatMap(a => a.absentTeachers).map((at, idx) => (
+                              <div key={idx} className="bg-white border-2 border-indigo-50 rounded-3xl p-6 shadow-sm">
+                                <div className="flex items-center gap-3 mb-4 border-b pb-4">
+                                  <div className="w-10 h-10 bg-red-50 rounded-full flex items-center justify-center text-red-600">
+                                    <UserX className="w-5 h-5" />
+                                  </div>
+                                  <div>
+                                    <p className="text-[10px] font-bold text-gray-400 uppercase">Absent Teacher</p>
+                                    <h5 className="font-black text-indigo-950">{at.teacherName}</h5>
+                                  </div>
+                                </div>
+                                <table className="w-full text-[10px]">
+                                  <thead>
+                                    <tr className="text-gray-400 border-b">
+                                      <th className="pb-2 text-left">Bell</th>
+                                      <th className="pb-2 text-left">Class</th>
+                                      <th className="pb-2 text-left">Substitute</th>
+                                    </tr>
+                                  </thead>
+                                  <tbody>
+                                    {at.substitutions.map((s, i) => (
+                                      <tr key={i} className="border-b last:border-0">
+                                        <td className="py-2 font-bold text-indigo-600">{s.bell}</td>
+                                        <td className="py-2 font-medium">{s.class}</td>
+                                        <td className="py-2 font-black text-gray-700">{s.substituteName}</td>
+                                      </tr>
+                                    ))}
+                                  </tbody>
+                                </table>
+                              </div>
+                            ))}
+                            {arrangements.filter(a => a.date === format(new Date(), 'yyyy-MM-dd')).length === 0 && (
+                              <div className="col-span-full py-12 text-center text-gray-400 bg-gray-50 rounded-3xl border-2 border-dashed">
+                                <Sparkles className="w-12 h-12 mx-auto mb-4 opacity-20" />
+                                <p>Today's arrangement has not been generated yet.</p>
+                              </div>
+                            )}
+                          </div>
+                        </div>
+                      </Card>
+                    )}
+
+                    {activeArrangementSubSection === 'leaves' && (
+                      <Card title="Leave Requests" icon={FileText}>
+                        <div className="grid md:grid-cols-2 gap-6">
+                          {leaves.sort((a, b) => b.startDate.localeCompare(a.startDate)).map(leave => (
+                            <div key={leave.id} className={`p-6 rounded-3xl border-2 transition-all ${leave.status === 'pending' ? 'border-orange-100 bg-orange-50/30' : leave.status === 'approved' ? 'border-green-100 bg-green-50/30' : 'border-red-100 bg-red-50/30'}`}>
+                              <div className="flex justify-between items-start mb-4">
+                                <div className="flex items-center gap-3">
+                                  <div className={`w-10 h-10 rounded-full flex items-center justify-center ${leave.status === 'pending' ? 'bg-orange-100 text-orange-600' : leave.status === 'approved' ? 'bg-green-100 text-green-600' : 'bg-red-100 text-red-600'}`}>
+                                    <Users className="w-5 h-5" />
+                                  </div>
+                                  <div>
+                                    <h5 className="font-bold text-gray-900">{leave.teacherName}</h5>
+                                    <p className="text-xs text-gray-500">{leave.mobile}</p>
+                                  </div>
+                                </div>
+                                <span className={`px-3 py-1 rounded-full text-[10px] font-bold uppercase ${leave.status === 'pending' ? 'bg-orange-100 text-orange-600' : leave.status === 'approved' ? 'bg-green-100 text-green-600' : 'bg-red-100 text-red-600'}`}>
+                                  {leave.status}
+                                </span>
+                              </div>
+                              <div className="space-y-3">
+                                <div className="flex items-center gap-2 text-sm text-gray-600">
+                                  <Calendar className="w-4 h-4" />
+                                  <span>{format(new Date(leave.startDate), 'dd MMM')} - {format(new Date(leave.endDate), 'dd MMM yyyy')}</span>
+                                </div>
+                                <p className="text-sm text-gray-700 bg-white/50 p-3 rounded-xl border border-gray-100 italic">"{leave.reason}"</p>
+                                
+                                {leave.status === 'pending' && (
+                                  <div className="flex gap-2 pt-2">
+                                    <button 
+                                      onClick={() => setDoc(doc(db, 'leaves', leave.id), { ...leave, status: 'approved' })}
+                                      className="flex-1 py-2 bg-green-600 text-white rounded-xl font-bold text-xs hover:bg-green-700 transition-all"
+                                    >
+                                      Approve
+                                    </button>
+                                    <button 
+                                      onClick={() => setDoc(doc(db, 'leaves', leave.id), { ...leave, status: 'rejected' })}
+                                      className="flex-1 py-2 bg-red-600 text-white rounded-xl font-bold text-xs hover:bg-red-700 transition-all"
+                                    >
+                                      Reject
+                                    </button>
+                                  </div>
+                                )}
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      </Card>
+                    )}
+                  </motion.div>
+                )}
+
+                {activeAdminSection === 'teachers' && (
+                  <motion.div initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: 20 }}>
+                    <Card title="Teacher Database" icon={Users}>
+                      <div className="flex justify-end mb-6">
+                        <button 
+                          onClick={exportTeacherList}
+                          className="bg-indigo-600 text-white px-6 py-3 rounded-xl font-bold text-sm hover:bg-indigo-700 shadow-lg flex items-center gap-2"
+                        >
+                          <Download className="w-5 h-5" /> Download Teacher List (Excel)
+                        </button>
+                      </div>
+                      <div className="overflow-x-auto">
+                        <table className="w-full text-sm">
+                          <thead>
+                            <tr className="bg-gray-50 text-gray-500 text-left">
+                              <th className="p-4 rounded-l-xl">Teacher Name</th>
+                              <th className="p-4">ID / Password</th>
+                              <th className="p-4">Classes / Subjects</th>
+                              <th className="p-4">Attendance (M/S)</th>
+                              <th className="p-4 rounded-r-xl">Action</th>
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {allTeachers.map(t => {
+                              const today = new Date();
+                              const monthStart = startOfMonth(today);
+                              const sessionStart = new Date(today.getFullYear(), 3, 1);
+                              if (today < sessionStart) sessionStart.setFullYear(today.getFullYear() - 1);
+                              
+                              const attMonth = allAttendance.filter(a => a.teacherId === t.uid && a.date >= format(monthStart, 'yyyy-MM-dd')).length;
+                              const attSession = allAttendance.filter(a => a.teacherId === t.uid && a.date >= format(sessionStart, 'yyyy-MM-dd')).length;
+                              
+                              return (
+                                <tr key={t.uid} className="border-b last:border-0 hover:bg-gray-50 transition-colors">
+                                  <td className="p-4 font-bold text-indigo-950">{t.name}</td>
+                                  <td className="p-4">
+                                    <p className="text-xs font-mono text-gray-600">{t.email.split('@')[0]}</p>
+                                    <p className="text-[10px] font-mono text-gray-400">{t.password || '******'}</p>
+                                  </td>
+                                  <td className="p-4">
+                                    <p className="text-[10px] font-bold text-indigo-600">{t.classes?.join(', ')}</p>
+                                    <p className="text-[10px] text-gray-500">{t.subjects?.join(', ')}</p>
+                                  </td>
+                                  <td className="p-4">
+                                    <div className="flex gap-2">
+                                      <span className="px-2 py-1 bg-green-50 text-green-600 rounded-md text-[10px] font-black">M: {attMonth}</span>
+                                      <span className="px-2 py-1 bg-indigo-50 text-indigo-600 rounded-md text-[10px] font-black">S: {attSession}</span>
+                                    </div>
+                                  </td>
+                                  <td className="p-4">
+                                    <button className="text-red-500 hover:text-red-700"><UserX className="w-5 h-5" /></button>
+                                  </td>
+                                </tr>
+                              );
+                            })}
+                          </tbody>
+                        </table>
+                      </div>
+                    </Card>
+                  </motion.div>
+                )}
+
+                {activeAdminSection === 'students' && (
+                  <motion.div initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: 20 }}>
+                    <Card title="Student Attendance Details" icon={UserPlus}>
+                      <div className="flex justify-end mb-6">
+                        <button 
+                          onClick={() => exportToExcel(studentAttendance, 'Student_Attendance_Report')}
+                          className="bg-indigo-600 text-white px-6 py-3 rounded-xl font-bold text-sm hover:bg-indigo-700 shadow-lg flex items-center gap-2"
+                        >
+                          <Download className="w-5 h-5" /> Download Report
+                        </button>
+                      </div>
+                      <div className="grid md:grid-cols-2 lg:grid-cols-3 gap-6">
+                        {schoolSettings.classes.map(cls => {
+                          const classData = studentAttendance.filter(s => s.class === cls).sort((a, b) => b.date.localeCompare(a.date));
+                          return (
+                            <div key={cls} className="bg-white border border-gray-100 rounded-3xl p-6 shadow-sm">
+                              <h5 className="text-lg font-black text-indigo-900 mb-4 border-b pb-2">Class {cls}</h5>
+                              <div className="space-y-3 max-h-60 overflow-y-auto pr-2">
+                                {classData.map((s, i) => (
+                                  <div key={i} className="p-3 bg-gray-50 rounded-xl text-[10px]">
+                                    <div className="flex justify-between font-bold mb-1">
+                                      <span>{format(new Date(s.date), 'dd MMM yyyy')}</span>
+                                      <span className="text-indigo-600">By {s.teacherName}</span>
+                                    </div>
+                                    <div className="grid grid-cols-3 gap-2 text-center">
+                                      <div className="bg-white p-1 rounded border">Total: {s.totalStudents}</div>
+                                      <div className="bg-green-50 p-1 rounded border border-green-100 text-green-600">P: {s.present}</div>
+                                      <div className="bg-red-50 p-1 rounded border border-red-100 text-red-600">A: {s.absent}</div>
+                                    </div>
+                                  </div>
+                                ))}
+                                {classData.length === 0 && <p className="text-center text-gray-400 py-4">No data uploaded yet.</p>}
+                              </div>
+                            </div>
+                          );
+                        })}
+                      </div>
+                    </Card>
+                  </motion.div>
+                )}
+
+                {activeAdminSection === 'timetable' && (
+                  <motion.div initial={{ opacity: 0, y: 20 }} animate={{ opacity: 1, y: 0 }} exit={{ opacity: 0, y: 20 }}>
+                    <Card title="Master Time Table" icon={Clock}>
+                      <div className="overflow-x-auto">
+                        <table className="w-full text-[10px] border-collapse">
+                          <thead>
+                            <tr className="bg-gray-50 border-b">
+                              <th className="p-3 text-left border-r sticky left-0 bg-gray-50 z-10">Class</th>
+                              {['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'].map(day => (
+                                <th key={day} className="p-2 border-r text-center font-black text-indigo-900">{day}</th>
+                              ))}
+                            </tr>
+                          </thead>
+                          <tbody>
+                            {schoolSettings.classes.map(cls => (
+                              <tr key={cls} className="border-b hover:bg-gray-50">
+                                <td className="p-3 border-r sticky left-0 bg-white z-10 font-black">Class {cls}</td>
+                                {['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'].map(day => (
+                                  <td key={day} className="p-1 border-r">
+                                    <div className="space-y-1">
+                                      {[1, 2, 3, 4, 5, 6, 7, 8].map(bell => {
+                                        const entry = fullTimetable.find(t => t.class === cls && t.day === day && t.bell === bell);
+                                        return entry ? (
+                                          <div key={bell} className="p-1 bg-indigo-50 rounded text-[8px] border border-indigo-100">
+                                            <span className="font-bold text-indigo-700">B{bell}:</span> {entry.subject} ({entry.teacherName})
+                                          </div>
+                                        ) : null;
+                                      })}
+                                    </div>
+                                  </td>
+                                ))}
+                              </tr>
+                            ))}
+                          </tbody>
+                        </table>
+                      </div>
+                    </Card>
+                  </motion.div>
+                )}
+              </AnimatePresence>
 
               <div className="space-y-8">
                 <Card title="Master Attendance Report" icon={LayoutDashboard}>
@@ -1007,11 +1845,29 @@ export default function App() {
                           )}
                           
                           {leave.status === 'approved' && (
-                            <div className="bg-indigo-50 p-3 rounded-xl border border-indigo-100 flex items-center justify-between">
-                              <div className="flex items-center gap-2 text-indigo-700 font-bold text-xs">
-                                <Sparkles className="w-4 h-4" /> AI Suggestion:
-                              </div>
-                              <span className="text-xs font-medium text-indigo-600">Substitute: Mr. Sharma (Free)</span>
+                            <div className="space-y-2">
+                              <button 
+                                onClick={() => handleAISubstitution(leave)}
+                                disabled={loadingAI}
+                                className="w-full py-2 bg-indigo-600 text-white rounded-xl font-bold text-xs hover:bg-indigo-700 transition-all flex items-center justify-center gap-2"
+                              >
+                                <Sparkles className="w-4 h-4" /> {loadingAI ? 'Analyzing...' : 'AI Suggest Substitution'}
+                              </button>
+                              
+                              {substitutionSuggestions.length > 0 && (
+                                <div className="bg-indigo-50 p-4 rounded-xl border border-indigo-100 space-y-3">
+                                  <p className="text-[10px] font-black text-indigo-900 uppercase flex items-center gap-1">
+                                    <Sparkles className="w-3 h-3" /> AI Suggestions for Today:
+                                  </p>
+                                  {substitutionSuggestions.map((s, i) => (
+                                    <div key={i} className="text-[10px] bg-white p-2 rounded-lg border border-indigo-50">
+                                      <p className="font-bold text-indigo-700">Bell {s.bell}: Class {s.class}</p>
+                                      <p className="text-gray-600">Substitute: <span className="font-black">{s.suggestedTeacher}</span></p>
+                                      <p className="text-[8px] text-gray-400 mt-1 italic">{s.reason}</p>
+                                    </div>
+                                  ))}
+                                </div>
+                              )}
                             </div>
                           )}
                         </div>
@@ -1025,11 +1881,46 @@ export default function App() {
                         <Sparkles className="absolute -right-4 -top-4 w-24 h-24 opacity-10" />
                         <h4 className="text-lg font-bold mb-2">Smart Scheduler</h4>
                         <p className="text-sm opacity-80 mb-4">Generate optimized time tables with max 6 bells per teacher.</p>
-                        <button className="w-full py-3 bg-white text-indigo-600 rounded-xl font-black hover:bg-indigo-50 transition-all shadow-lg">
-                          AI Generate Time Table
+                        <button 
+                          onClick={handleGenerateTimetable}
+                          disabled={isGeneratingAI}
+                          className="w-full py-3 bg-white text-indigo-600 rounded-xl font-black hover:bg-indigo-50 transition-all shadow-lg disabled:opacity-50"
+                        >
+                          {isGeneratingAI ? 'Generating...' : 'AI Generate Time Table'}
                         </button>
                       </div>
                       
+                      <div className="space-y-4 border-t pt-4">
+                        <div className="flex items-center justify-between">
+                          <h4 className="font-bold text-gray-700">Class Subject Requirements</h4>
+                          <span className="text-[10px] bg-indigo-100 px-2 py-1 rounded-md text-indigo-600 font-bold">AI INPUT</span>
+                        </div>
+                        <div className="max-h-60 overflow-y-auto space-y-2 pr-2">
+                          {schoolSettings.classes.map(cls => (
+                            <div key={cls} className="p-3 bg-gray-50 rounded-xl border border-gray-100">
+                              <p className="text-xs font-black text-indigo-900 mb-2 uppercase">Class {cls}</p>
+                              <div className="grid grid-cols-2 gap-2">
+                                {schoolSettings.subjects.map(sub => {
+                                  const req = subjectRequirements.find(r => r.class === cls && r.subject === sub);
+                                  return (
+                                    <div key={sub} className="flex items-center justify-between bg-white p-2 rounded-lg border border-gray-100">
+                                      <span className="text-[10px] font-bold text-gray-600">{sub}</span>
+                                      <input 
+                                        type="number" 
+                                        min="0" max="6"
+                                        className="w-10 text-center text-[10px] font-black border-b border-indigo-200 outline-none"
+                                        value={req?.frequencyPerWeek || 0}
+                                        onChange={(e) => updateRequirement({ class: cls, subject: sub, frequencyPerWeek: parseInt(e.target.value) || 0 })}
+                                      />
+                                    </div>
+                                  );
+                                })}
+                              </div>
+                            </div>
+                          ))}
+                        </div>
+                      </div>
+
                       <div className="space-y-4 border-t pt-4">
                         <div className="flex items-center justify-between">
                           <h4 className="font-bold text-gray-700">Manage Subjects</h4>
@@ -1067,15 +1958,6 @@ export default function App() {
                             </span>
                           ))}
                         </div>
-                      </div>
-
-                      <div className="grid grid-cols-2 gap-4">
-                        <button className="p-4 bg-white border-2 border-gray-100 rounded-2xl text-sm font-bold hover:border-indigo-200 hover:bg-indigo-50 transition-all flex items-center justify-center gap-2">
-                          <Users className="w-4 h-4" /> Teacher List
-                        </button>
-                        <button className="p-4 bg-white border-2 border-gray-100 rounded-2xl text-sm font-bold hover:border-indigo-200 hover:bg-indigo-50 transition-all flex items-center justify-center gap-2">
-                          <Settings className="w-4 h-4" /> Class Settings
-                        </button>
                       </div>
                     </div>
                   </Card>

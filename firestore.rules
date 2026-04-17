@@ -15,12 +15,13 @@ service cloud.firestore {
     
     function isAdmin() {
       return isAuthenticated() && 
-        (getUserData().role == 'admin' || 
-         request.auth.token.email == "jitendrakumart557@gmail.com");
+        (request.auth.token.email == "jitendrakumart557@gmail.com" || 
+         request.auth.token.email == "admin@ssm.portal" ||
+         get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin');
     }
     
     function isTeacher() {
-      return isAuthenticated() && getUserData().role == 'teacher';
+      return isAuthenticated() && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'teacher';
     }
 
     function isOwner(userId) {
@@ -33,7 +34,7 @@ service cloud.firestore {
 
     match /users/{userId} {
       allow read: if isAuthenticated();
-      allow create: if isAuthenticated() && (isOwner(userId) || isAdmin());
+      allow create: if isAuthenticated();
       allow update: if isAuthenticated() && (isOwner(userId) || isAdmin());
     }
 
@@ -43,26 +44,32 @@ service cloud.firestore {
     }
 
     match /attendance/{recordId} {
-      allow read: if isAdmin() || (isAuthenticated() && request.auth.uid == resource.data.teacherId);
+      allow read: if isAdmin() || (isAuthenticated() && (resource == null || resource.data.teacherId == request.auth.uid));
       allow create: if isAuthenticated();
       allow update, delete: if isAdmin();
     }
 
     match /leaves/{leaveId} {
-      allow read: if isAdmin() || (isAuthenticated() && request.auth.uid == resource.data.teacherId);
+      allow read: if isAdmin() || (isAuthenticated() && (resource == null || resource.data.teacherId == request.auth.uid));
       allow create: if isAuthenticated();
-      allow update: if isAdmin();
+      allow update: if isAdmin() || (isAuthenticated() && resource.data.teacherId == request.auth.uid && request.resource.data.status == resource.data.status);
       allow delete: if isAdmin();
     }
 
-    match /timetable/{tableId} {
+    match /settings/{settingId} {
+      allow read: if isAuthenticated() || settingId == 'school';
+      allow write: if isAdmin();
+    }
+
+    match /arrangements/{arrangementId} {
       allow read: if isAuthenticated();
       allow write: if isAdmin();
     }
 
-    match /settings/school {
-      allow read: if true;
-      allow write: if isAdmin();
+    match /studentAttendance/{attId} {
+      allow read: if isAuthenticated();
+      allow create: if isAuthenticated();
+      allow update, delete: if isAdmin();
     }
   }
 }
