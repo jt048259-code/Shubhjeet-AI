@@ -20,7 +20,8 @@ import {
 } from 'firebase/firestore';
 import { 
   getAuth, onAuthStateChanged, signInWithEmailAndPassword, 
-  signOut, GoogleAuthProvider, signInWithPopup 
+  signOut, GoogleAuthProvider, signInWithPopup,
+  setPersistence, browserSessionPersistence
 } from 'firebase/auth';
 import { 
   format, startOfMonth, endOfMonth, eachDayOfInterval, 
@@ -36,6 +37,7 @@ import firebaseConfig from '../firebase-applet-config.json';
 const app = initializeApp(firebaseConfig);
 const db = getFirestore(app, (firebaseConfig as any).firestoreDatabaseId);
 const auth = getAuth(app);
+setPersistence(auth, browserSessionPersistence);
 const provider = new GoogleAuthProvider();
 
 // Connection test
@@ -351,8 +353,15 @@ export default function App() {
   const [attendanceCode, setAttendanceCode] = useState<string | null>(null);
   const [loadingAI, setLoadingAI] = useState(false);
   const [substitutionSuggestions, setSubstitutionSuggestions] = useState<any[]>([]);
+  const [showAllLeaves, setShowAllLeaves] = useState(false);
 
   // --- Auth Handlers ---
+
+  useEffect(() => {
+    if (userProfile && (view === 'loginSelection' || view === 'adminLogin' || view === 'teacherLogin' || view === 'teacherSignUp')) {
+      setView(userProfile.role === 'admin' ? 'adminPortal' : 'teacherPortal');
+    }
+  }, [userProfile, view]);
 
   useEffect(() => {
     const unsub = onAuthStateChanged(auth, async (u) => {
@@ -395,6 +404,38 @@ export default function App() {
     setUserProfile(null);
   };
 
+  const handleGoogleLogin = async () => {
+    try {
+      setLoginLoading(true);
+      const res = await signInWithPopup(auth, provider);
+      // Check if profile exists for Google user
+      const snap = await getDoc(doc(db, 'users', res.user.uid));
+      if (!snap.exists()) {
+        const profile: Teacher = {
+          uid: res.user.uid,
+          name: res.user.displayName || 'Unnamed User',
+          email: res.user.email!,
+          mobile: '0000000000',
+          classes: [],
+          subjects: [],
+          role: (res.user.email === 'jitendrakumart557@gmail.com' || res.user.email === 'admin@ssm.portal') ? 'admin' : 'teacher'
+        };
+        await setDoc(doc(db, 'users', res.user.uid), profile);
+        setUserProfile(profile);
+        setView(profile.role === 'admin' ? 'adminPortal' : 'teacherPortal');
+      } else {
+        const profile = snap.data() as Teacher;
+        setUserProfile(profile);
+        setView(profile.role === 'admin' ? 'adminPortal' : 'teacherPortal');
+      }
+    } catch (err: any) {
+      console.error("Google Login Error:", err);
+      alert("Google Login Error: " + err.message);
+    } finally {
+      setLoginLoading(false);
+    }
+  };
+
   const handleLogin = async (e: React.FormEvent) => {
     e.preventDefault();
     setLoginLoading(true);
@@ -404,7 +445,7 @@ export default function App() {
       const inputId = loginForm.email?.trim().toUpperCase();
       console.log("Admin ID Input:", inputId);
       
-      if (inputId === 'SSM100728' && loginForm.password === '9923123') {
+      if (inputId === 'SSM100728' && loginForm.password.trim() === '9923123') {
         const adminEmail = 'admin@ssm.portal';
         const adminPass = '9923123';
         try {
@@ -440,7 +481,9 @@ export default function App() {
           console.log("Admin portal view set.");
         } catch (err: any) {
           console.error("Admin login error:", err);
-          if (err.code === 'auth/user-not-found') {
+          // Catch both old and new Firebase Auth error codes for 'not found' / 'invalid'
+          if (err.code === 'auth/user-not-found' || err.code === 'auth/invalid-credential' || err.code === 'auth/invalid-login-credentials') {
+            console.log("Admin account not found or invalid, attempting to create/reset...");
             try {
               const { createUserWithEmailAndPassword } = await import('firebase/auth');
               const res = await createUserWithEmailAndPassword(auth, adminEmail, adminPass);
@@ -457,7 +500,13 @@ export default function App() {
               setUserProfile(profile);
               setView('adminPortal');
             } catch (regErr: any) {
-              alert("Admin Creation Error: " + regErr.message);
+              // If user already exists but password was wrong, we can't easily fix it without admin SDK or reset email
+              // But for this sandbox, we usually want to ensure the account works.
+              if (regErr.code === 'auth/email-already-in-use') {
+                alert("The Admin account already exists with a different password. Please contact support or reset password.");
+              } else {
+                alert("Admin Access Error: " + regErr.message);
+              }
             }
           } else {
             alert("Admin Login Error: " + err.message);
@@ -517,7 +566,9 @@ export default function App() {
     const unsubTeachers = userProfile?.role === 'admin' 
       ? onSnapshot(collection(db, 'users'), 
           (snap) => {
-            setAllTeachers(snap.docs.map(doc => ({ uid: doc.id, ...doc.data() } as Teacher)));
+            const users = snap.docs.map(doc => ({ uid: doc.id, ...doc.data() } as Teacher));
+            // Filter out admins from being treated as teachers
+            setAllTeachers(users.filter(u => u.role !== 'admin' && !u.email?.includes('admin') && u.name !== 'SSM Admin' && u.name !== 'Master Admin' && u.name !== 'Jitendra Kumar Tripathi'));
           },
           (error) => handleFirestoreError(error, OperationType.LIST, 'users')
         )
@@ -618,19 +669,22 @@ export default function App() {
   const markTodayAsHoliday = async () => {
     const today = format(new Date(), 'yyyy-MM-dd');
     const isSunday = getDay(new Date()) === 0;
-    const defaultReason = isSunday ? 'Sunday' : '';
+    const defaultReason = isSunday ? 'Sunday' : 'Public Holiday';
     
-    const reason = prompt("Enter holiday reason (or space for vertical list):", defaultReason);
-    if (reason === null) return;
+    // Use a simple prompt but handle it better
+    const reason = window.prompt("Enter holiday reason:", defaultReason);
+    if (!reason && reason !== "") return;
 
     try {
+      const holidayReason = reason || defaultReason;
       await setDoc(doc(db, 'holidays', today), {
         date: today,
-        reason: reason || (isSunday ? 'Sunday' : 'Holiday')
+        reason: holidayReason
       });
-      alert("Holiday Marked!");
+      alert(`Holiday "${holidayReason}" Marked for Today!`);
     } catch (err) {
-      alert("Error marking holiday.");
+      console.error("Holiday Error:", err);
+      alert("Error marking holiday. Please check connection.");
     }
   };
 
@@ -773,6 +827,46 @@ export default function App() {
     }
   };
 
+  const exportTimetable = (type: 'teacher' | 'class') => {
+    const daysArr = ['Monday', 'Tuesday', 'Wednesday', 'Thursday', 'Friday', 'Saturday'];
+    const wb = XLSX.utils.book_new();
+    
+    if (type === 'teacher') {
+      const data = allTeachers.map(teacher => {
+        const row: any = { 'Teacher Name': teacher.name };
+        daysArr.forEach(day => {
+          const dayEntries = timetable
+            .filter(t => t.teacherId === teacher.uid && t.day === day)
+            .sort((a,b) => a.bell - b.bell)
+            .map(t => `B${t.bell}:${t.class}${t.section}(${t.subject})`)
+            .join(' | ');
+          row[day] = dayEntries || 'FREE';
+        });
+        return row;
+      });
+      const ws = XLSX.utils.json_to_sheet(data);
+      XLSX.utils.book_append_sheet(wb, ws, "Teacher Timetable");
+    } else {
+      const classes = [...new Set(timetable.map(t => `${t.class}${t.section}`))].sort();
+      const data = classes.map(cls => {
+        const row: any = { 'Class': cls };
+        daysArr.forEach(day => {
+          const dayEntries = timetable
+            .filter(t => `${t.class}${t.section}` === cls && t.day === day)
+            .sort((a,b) => a.bell - b.bell)
+            .map(t => `B${t.bell}:${t.subject}(${allTeachers.find(at => at.uid === t.teacherId)?.name || 'N/A'})`)
+            .join(' | ');
+          row[day] = dayEntries || '-';
+        });
+        return row;
+      });
+      const ws = XLSX.utils.json_to_sheet(data);
+      XLSX.utils.book_append_sheet(wb, ws, "Class Timetable");
+    }
+    
+    XLSX.writeFile(wb, `SSM_Timetable_${type}_wise.xlsx`);
+  };
+
   // --- Sub-Components for Admin ---
 
   const TimetableSection = () => {
@@ -801,76 +895,93 @@ export default function App() {
               </button>
             </div>
 
-            <div className="overflow-x-auto border-2 border-indigo-50/50 rounded-2xl">
+            <div className="overflow-x-auto border-2 border-indigo-50/50 rounded-2xl p-4 bg-white">
+              <div className="flex justify-between items-center mb-6">
+                <h4 className="text-xl font-black text-indigo-950 uppercase tracking-tighter">Current Schedule</h4>
+                <button 
+                  onClick={() => exportTimetable(timetableViewState)}
+                  className="bg-green-600 text-white px-6 py-2.5 rounded-2xl font-black text-[10px] tracking-widest flex items-center gap-2 hover:bg-green-700 transition-all shadow-xl shadow-green-100 uppercase"
+                >
+                  <Download className="w-4 h-4" /> Export {timetableViewState}-wise Excel
+                </button>
+              </div>
+
               {timetableViewState === 'teacher' ? (
-                <table className="w-full text-[10px] border-collapse">
-                  <thead className="bg-indigo-50/50">
-                    <tr>
-                      <th className="p-3 text-left font-black border-b border-r sticky left-0 bg-indigo-50/50 z-10">Teacher</th>
-                      {daysArr.map(day => (
-                        <th key={day} className="p-2 border-b border-r text-center font-black min-w-[120px]">{day}</th>
-                      ))}
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {allTeachers.map(teacher => (
-                      <tr key={teacher.uid} className="hover:bg-indigo-50/30">
-                        <td className="p-3 border-b border-r font-bold sticky left-0 bg-white z-10">{teacher.name}</td>
+                <div className="overflow-x-auto">
+                  <table className="w-full text-[10px] border-collapse">
+                    <thead className="bg-indigo-50/50">
+                      <tr>
+                        <th className="p-3 text-left font-black border-b border-r sticky left-0 bg-indigo-50/50 z-10 transition-colors">Teacher</th>
                         {daysArr.map(day => (
-                          <td key={day} className="p-2 border-b border-r align-top">
-                            <div className="space-y-1">
-                              {[1, 2, 3, 4, 5, 6, 7, 8].map(bell => {
-                                const entry = timetable.find(e => e.teacherId === teacher.uid && e.day === day && e.bell === bell);
-                                if (!entry) return null;
-                                return (
-                                  <div key={bell} className="bg-indigo-50 p-1 rounded border border-indigo-100">
-                                    <span className="font-bold text-indigo-700">Bell {bell}:</span> Class {entry.class}{entry.section}
-                                  </div>
-                                );
-                              })}
-                            </div>
-                          </td>
+                          <th key={day} className="p-2 border-b border-r text-center font-black min-w-[140px] uppercase text-indigo-600">{day}</th>
                         ))}
                       </tr>
-                    ))}
-                  </tbody>
-                </table>
+                    </thead>
+                    <tbody>
+                      {allTeachers.map(teacher => (
+                        <tr key={teacher.uid} className="hover:bg-indigo-50/30 group">
+                          <td className="p-3 border-b border-r font-black sticky left-0 bg-white z-10 group-hover:bg-indigo-50/30">{teacher.name}</td>
+                          {daysArr.map(day => (
+                            <td key={day} className="p-1 border-b border-r align-top">
+                              <div className="space-y-1">
+                                {timetable.filter(e => e.teacherId === teacher.uid && e.day === day).sort((a,b) => a.bell - b.bell).map((entry, idx) => (
+                                  <div key={idx} className="p-2 bg-indigo-50/50 rounded-xl border border-indigo-100/50">
+                                    <p className="font-black text-indigo-900 leading-none mb-1 text-[9px]">BELL {entry.bell}</p>
+                                    <p className="font-black text-indigo-600 leading-none">{entry.class}{entry.section}</p>
+                                    <p className="text-[8px] opacity-60 font-bold uppercase mt-1 line-clamp-1">{entry.subject}</p>
+                                  </div>
+                                ))}
+                                {timetable.filter(e => e.teacherId === teacher.uid && e.day === day).length === 0 && (
+                                  <div className="py-2 text-center opacity-10 text-[8px] font-black uppercase">Free</div>
+                                )}
+                              </div>
+                            </td>
+                          ))}
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
               ) : (
-                <table className="w-full text-[10px] border-collapse">
-                  <thead className="bg-indigo-50/50">
-                    <tr>
-                      <th className="p-3 text-left font-black border-b border-r sticky left-0 bg-indigo-50/50 z-10">Class</th>
-                      {daysArr.map(day => (
-                        <th key={day} className="p-2 border-b border-r text-center font-black min-w-[120px]">{day}</th>
-                      ))}
-                    </tr>
-                  </thead>
-                  <tbody>
-                    {FLattenClasses.map(cls => (
-                      <tr key={cls} className="hover:bg-indigo-50/30">
-                        <td className="p-3 border-b border-r font-bold sticky left-0 bg-white z-10">Class {cls}</td>
+                <div className="overflow-x-auto">
+                  <table className="w-full text-[10px] border-collapse">
+                    <thead className="bg-indigo-50/50">
+                      <tr>
+                        <th className="p-3 text-left font-black border-b border-r sticky left-0 bg-indigo-50/50 z-10 transition-colors">Class</th>
                         {daysArr.map(day => (
-                          <td key={day} className="p-2 border-b border-r align-top">
-                            <div className="space-y-1">
-                              {[1, 2, 3, 4, 5, 6, 7, 8].map(bell => {
-                                const level = cls.slice(0, -1);
-                                const section = cls.slice(-1);
-                                const entry = timetable.find(e => e.class === level && e.section === section && e.day === day && e.bell === bell);
-                                if (!entry) return null;
-                                return (
-                                  <div key={bell} className="bg-green-50 p-1 rounded border border-green-100">
-                                    <span className="font-bold text-green-700">Bell {bell}:</span> {entry.subject}<br/>
-                                    <span className="text-[8px] text-gray-500 italic">{entry.teacherName}</span>
-                                  </div>
-                                );
-                              })}
-                            </div>
-                          </td>
+                          <th key={day} className="p-2 border-b border-r text-center font-black min-w-[140px] uppercase text-indigo-600">{day}</th>
                         ))}
                       </tr>
-                    ))}
-                  </tbody>
-                </table>
+                    </thead>
+                    <tbody>
+                      {FLattenClasses.map(cls => (
+                        <tr key={cls} className="hover:bg-indigo-50/30 group">
+                          <td className="p-3 border-b border-r font-black sticky left-0 bg-white z-10 group-hover:bg-indigo-50/30 text-center">Class {cls}</td>
+                          {daysArr.map(day => {
+                            const level = cls.slice(0, -1);
+                            const section = cls.slice(-1);
+                            return (
+                              <td key={day} className="p-1 border-b border-r align-top">
+                                <div className="space-y-1">
+                                  {timetable.filter(e => e.class === level && e.section === section && e.day === day).sort((a,b) => a.bell - b.bell).map((entry, idx) => (
+                                    <div key={idx} className="p-2 bg-orange-50/50 rounded-xl border border-orange-100/50">
+                                      <p className="font-black text-orange-900 leading-none mb-1 text-[9px]">BELL {entry.bell}</p>
+                                      <p className="font-black text-orange-600 leading-none">{entry.subject}</p>
+                                      <p className="text-[8px] opacity-60 font-bold uppercase mt-1 line-clamp-1">{allTeachers.find(at => at.uid === entry.teacherId)?.name || 'N/A'}</p>
+                                    </div>
+                                  ))}
+                                  {timetable.filter(e => e.class === level && e.section === section && e.day === day).length === 0 && (
+                                    <div className="py-2 text-center opacity-10 text-[8px] font-black uppercase">-</div>
+                                  )}
+                                </div>
+                              </td>
+                            );
+                          })}
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                </div>
               )}
             </div>
           </div>
@@ -1139,6 +1250,27 @@ export default function App() {
                     className="w-full bg-indigo-600 text-white font-black py-4 rounded-2xl shadow-xl shadow-indigo-600/20 hover:bg-indigo-700 transition-all uppercase tracking-widest text-sm disabled:opacity-50 flex items-center justify-center gap-2"
                   >
                     {loginLoading ? <div className="w-4 h-4 border-2 border-white border-t-transparent rounded-full animate-spin"></div> : 'Access Portal'}
+                  </button>
+
+                  <div className="relative py-4 flex items-center justify-center">
+                    <div className="flex-grow border-t border-gray-100"></div>
+                    <span className="flex-shrink mx-4 text-[10px] font-black text-gray-300 uppercase tracking-widest">OR</span>
+                    <div className="flex-grow border-t border-gray-100"></div>
+                  </div>
+
+                  <button 
+                    type="button" 
+                    onClick={handleGoogleLogin}
+                    disabled={loginLoading}
+                    className="w-full bg-white border-2 border-indigo-50 text-indigo-950 font-black py-4 rounded-2xl hover:bg-indigo-50 transition-all uppercase tracking-widest text-sm disabled:opacity-50 flex items-center justify-center gap-3 shadow-sm"
+                  >
+                    <svg className="w-5 h-5" viewBox="0 0 24 24">
+                      <path fill="#4285F4" d="M22.56 12.25c0-.78-.07-1.53-.2-2.25H12v4.26h5.92c-.26 1.37-1.04 2.53-2.21 3.31v2.77h3.57c2.08-1.92 3.28-4.74 3.28-8.09z"/>
+                      <path fill="#34A853" d="M12 23c2.97 0 5.46-.98 7.28-2.66l-3.57-2.77c-.98.66-2.23 1.06-3.71 1.06-2.86 0-5.29-1.93-6.16-4.53H2.18v2.84C3.99 20.53 7.7 23 12 23z"/>
+                      <path fill="#FBBC05" d="M5.84 14.09c-.22-.66-.35-1.36-.35-2.09s.13-1.43.35-2.09V7.07H2.18C1.43 8.55 1 10.22 1 12s.43 3.45 1.18 4.93l3.66-2.84z"/>
+                      <path fill="#EA4335" d="M12 5.38c1.62 0 3.06.56 4.21 1.64l3.15-3.15C17.45 2.09 14.97 1 12 1 7.7 1 3.99 3.47 2.18 7.07l3.66 2.84c.87-2.6 3.3-4.53 6.16-4.53z"/>
+                    </svg>
+                    Continue with Google
                   </button>
 
                   {view === 'teacherLogin' && (
@@ -1524,36 +1656,54 @@ export default function App() {
                   )}
 
                   {activeArrangementTab === 'leaves' && (
-                    <Card title="Active Leave Applications" icon={Mail}>
-                       <div className="grid md:grid-cols-2 lg:grid-cols-3 gap-6">
-                        {leaves.filter(l => l.status === 'pending').map(l => (
-                          <div key={l.id} className="bg-white p-8 rounded-[2rem] border-2 border-indigo-50 hover:border-indigo-600 transition-all">
-                             <div className="flex justify-between items-start mb-6">
-                                <div>
-                                   <h5 className="text-2xl font-black text-indigo-950 leading-tight">{l.teacherName}</h5>
-                                   <p className="text-xs font-bold text-indigo-400">{l.mobile}</p>
-                                </div>
-                                <span className="bg-orange-50 text-orange-600 rounded-full px-3 py-1 text-[10px] font-black uppercase tracking-widest border border-orange-100">Review</span>
-                             </div>
-                             <div className="bg-gray-50 p-5 rounded-2xl mb-6 relative overflow-hidden">
-                                <div className="absolute top-0 left-0 w-1 h-full bg-indigo-200"></div>
-                                <p className="text-xs font-bold text-indigo-950 mb-2 flex items-center gap-2"><Calendar className="w-4 h-4 text-indigo-400"/> {l.startDate} to {l.endDate}</p>
-                                <p className="text-sm italic text-gray-600">"{l.reason}"</p>
-                             </div>
-                             <div className="flex gap-4">
-                                <button onClick={() => updateDoc(doc(db, 'leaves', l.id), { status: 'approved' })} className="flex-1 bg-green-500 text-white font-black py-4 rounded-xl text-xs hover:bg-green-600 shadow-lg shadow-green-100 uppercase">Approve</button>
-                                <button onClick={() => updateDoc(doc(db, 'leaves', l.id), { status: 'rejected' })} className="flex-1 bg-red-100 text-red-500 font-black py-4 rounded-xl text-xs hover:bg-red-500 hover:text-white uppercase transition-all">Reject</button>
-                             </div>
+                    <div className="space-y-10">
+                      <Card title="Active Leave Applications" icon={Mail}
+                        headerAction={
+                          <div className="flex bg-indigo-50 rounded-xl p-1">
+                             <button onClick={() => setShowAllLeaves(false)} className={`px-4 py-1.5 rounded-lg text-xs font-black uppercase tracking-widest transition-all ${!showAllLeaves ? 'bg-indigo-600 text-white shadow-lg' : 'text-indigo-400'}`}>Pending</button>
+                             <button onClick={() => setShowAllLeaves(true)} className={`px-4 py-1.5 rounded-lg text-xs font-black uppercase tracking-widest transition-all ${showAllLeaves ? 'bg-indigo-600 text-white shadow-lg' : 'text-indigo-400'}`}>All History</button>
                           </div>
-                        ))}
-                        {leaves.filter(l => l.status === 'pending').length === 0 && (
-                          <div className="col-span-full py-24 text-center">
-                             <Mail className="w-16 h-16 text-indigo-100 mx-auto mb-4" />
-                             <p className="text-gray-400 italic font-bold">Inbox clear. No pending leave requests to review.</p>
-                          </div>
-                        )}
-                      </div>
-                    </Card>
+                        }
+                      >
+                         <div className="grid md:grid-cols-2 lg:grid-cols-3 gap-6">
+                          {leaves.filter(l => showAllLeaves ? true : l.status === 'pending').sort((a,b) => b.startDate.localeCompare(a.startDate)).map(l => (
+                            <div key={l.id} className="bg-white p-8 rounded-[2rem] border-2 border-indigo-50 hover:border-indigo-600 transition-all group">
+                               <div className="flex justify-between items-start mb-6">
+                                  <div>
+                                     <h5 className="text-2xl font-black text-indigo-950 leading-tight">{l.teacherName}</h5>
+                                     <p className="text-xs font-bold text-indigo-400">{l.mobile}</p>
+                                  </div>
+                                  <span className={`rounded-full px-3 py-1 text-[10px] font-black uppercase tracking-widest border ${
+                                    l.status === 'approved' ? 'bg-green-50 text-green-600 border-green-100' : 
+                                    l.status === 'rejected' ? 'bg-red-50 text-red-600 border-red-100' : 
+                                    'bg-orange-50 text-orange-600 border-orange-100'
+                                  }`}>{l.status === 'pending' ? 'Review' : l.status}</span>
+                               </div>
+                               <div className="bg-gray-50 p-5 rounded-2xl mb-6 relative overflow-hidden group-hover:bg-indigo-50 transition-colors">
+                                  <div className={`absolute top-0 left-0 w-1 h-full ${l.status === 'approved' ? 'bg-green-400' : l.status === 'rejected' ? 'bg-red-400' : 'bg-indigo-200'}`}></div>
+                                  <p className="text-xs font-bold text-indigo-950 mb-2 flex items-center gap-2 font-mono"><Calendar className="w-4 h-4 text-indigo-400"/> {l.startDate} » {l.endDate}</p>
+                                  <p className="text-sm italic text-gray-600 font-medium">"{l.reason}"</p>
+                               </div>
+                               {l.status === 'pending' && (
+                                 <div className="flex gap-4">
+                                    <button onClick={async () => { if(confirm("Approve this leave?")) await updateDoc(doc(db, 'leaves', l.id), { status: 'approved' }); }} className="flex-1 bg-green-500 text-white font-black py-4 rounded-xl text-xs hover:bg-green-600 shadow-lg shadow-green-100 uppercase transition-all">Approve</button>
+                                    <button onClick={async () => { if(confirm("Reject this leave?")) await updateDoc(doc(db, 'leaves', l.id), { status: 'rejected' }); }} className="flex-1 bg-red-100 text-red-500 font-black py-4 rounded-xl text-xs hover:bg-red-500 hover:text-white uppercase transition-all">Reject</button>
+                                 </div>
+                               )}
+                               {l.status !== 'pending' && (
+                                 <button onClick={async () => { if(confirm("Move back to pending for re-evaluation?")) await updateDoc(doc(db, 'leaves', l.id), { status: 'pending' }); }} className="w-full py-4 border-2 border-dashed border-gray-100 rounded-xl text-[10px] font-black text-gray-400 uppercase tracking-widest hover:border-indigo-200 hover:text-indigo-400 transition-all">Reset Status</button>
+                               )}
+                            </div>
+                          ))}
+                          {leaves.filter(l => showAllLeaves ? true : l.status === 'pending').length === 0 && (
+                            <div className="col-span-full py-24 text-center">
+                               <Mail className="w-16 h-16 text-indigo-100 mx-auto mb-4" />
+                               <p className="text-gray-400 italic font-bold">No leave requests found in this category.</p>
+                            </div>
+                          )}
+                        </div>
+                      </Card>
+                    </div>
                   )}
                 </div>
               )}
