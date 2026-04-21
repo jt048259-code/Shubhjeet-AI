@@ -339,6 +339,8 @@ export default function App() {
   const [timetable, setTimetable] = useState<TimetableEntry[]>([]);
   const [schoolSettings, setSchoolSettings] = useState<SchoolSettings>({ subjects: [], classes: [] });
   const [subjectRequirements, setSubjectRequirements] = useState<SubjectRequirement[]>([]);
+  const [editingTeacher, setEditingTeacher] = useState<Teacher | null>(null);
+  const [isEditingProfile, setIsEditingProfile] = useState(false);
 
   const [activeAdminSection, setActiveAdminSection] = useState<'dashboard' | 'attendance' | 'arrangement' | 'teachers' | 'timetable' | 'students'>('dashboard');
   const [activeArrangementTab, setActiveArrangementTab] = useState<'view' | 'generate' | 'leaves'>('generate');
@@ -354,14 +356,22 @@ export default function App() {
   const [loadingAI, setLoadingAI] = useState(false);
   const [substitutionSuggestions, setSubstitutionSuggestions] = useState<any[]>([]);
   const [showAllLeaves, setShowAllLeaves] = useState(false);
+  const [showHolidayModal, setShowHolidayModal] = useState(false);
+  const [holidayForm, setHolidayForm] = useState({ startDate: format(new Date(), 'yyyy-MM-dd'), endDate: format(new Date(), 'yyyy-MM-dd'), reason: '' });
+
+  useEffect(() => {
+    document.title = "SSM Teacher Portal";
+  }, []);
 
   // --- Auth Handlers ---
 
+  /* 
   useEffect(() => {
     if (userProfile && (view === 'loginSelection' || view === 'adminLogin' || view === 'teacherLogin' || view === 'teacherSignUp')) {
       setView(userProfile.role === 'admin' ? 'adminPortal' : 'teacherPortal');
     }
   }, [userProfile, view]);
+  */
 
   useEffect(() => {
     // Public settings fetchers
@@ -372,16 +382,8 @@ export default function App() {
       (error) => handleFirestoreError(error, OperationType.GET, 'settings/school')
     );
 
-    const unsubTimetable = onSnapshot(doc(db, 'settings', 'timetable'), 
-      (snap) => {
-        if (snap.exists()) setTimetable(snap.data().entries || []);
-      },
-      (error) => handleFirestoreError(error, OperationType.GET, 'settings/timetable')
-    );
-
     return () => {
       unsubSettings();
-      unsubTimetable();
     };
   }, []);
 
@@ -481,7 +483,7 @@ export default function App() {
       const inputId = loginForm.email?.trim().toUpperCase();
       console.log("Admin ID Input:", inputId);
       
-      if (inputId === 'SSM100728' && loginForm.password.trim() === '9923123') {
+      if (inputId === 'SSM100728' && (loginForm.password || '').trim() === '9923123') {
         const adminEmail = 'admin@ssm.portal';
         const adminPass = '9923123';
         try {
@@ -516,10 +518,12 @@ export default function App() {
           setView('adminPortal');
           console.log("Admin portal view set.");
         } catch (err: any) {
-          console.error("Admin login error:", err);
-          // Catch both old and new Firebase Auth error codes for 'not found' / 'invalid'
-          if (err.code === 'auth/user-not-found' || err.code === 'auth/invalid-credential' || err.code === 'auth/invalid-login-credentials') {
-            console.log("Admin account not found or invalid, attempting to create/reset...");
+          console.error("Admin login error primary attempt:", err);
+          // If first attempt fails (account likely doesn't exist or pass mismatch)
+          // we try to create it. If create fails with 'email-already-in-use', then 
+          // password definitely mismatch, but at least we tried.
+          if (err.code === 'auth/user-not-found' || err.code === 'auth/invalid-credential' || err.code === 'auth/invalid-login-credentials' || err.code === 'auth/wrong-password') {
+            console.log("Admin account issue, attempting to create or guide...");
             try {
               const { createUserWithEmailAndPassword } = await import('firebase/auth');
               const res = await createUserWithEmailAndPassword(auth, adminEmail, adminPass);
@@ -536,10 +540,8 @@ export default function App() {
               setUserProfile(profile);
               setView('adminPortal');
             } catch (regErr: any) {
-              // If user already exists but password was wrong, we can't easily fix it without admin SDK or reset email
-              // But for this sandbox, we usually want to ensure the account works.
-              if (regErr.code === 'auth/email-already-in-use') {
-                alert("The Admin account already exists with a different password. Please contact support or reset password.");
+              if (regErr.code === 'auth/email-already-in-use' || (err.code === 'auth/invalid-credential' && regErr.code === 'auth/invalid-credential')) {
+                alert("Master Admin Password Mismatch: The admin account 'admin@ssm.portal' exists but has a different password in Firebase than code. Try logging in with your owner Google Account (`jitendrakumart557@gmail.com`) using the 'CONTINUE WITH OWNER GOOGLE' button.");
               } else {
                 alert("Admin Access Error: " + regErr.message);
               }
@@ -597,14 +599,15 @@ export default function App() {
   }, [leaves, userProfile]);
 
   useEffect(() => {
-    if (!user || (userProfile?.role !== 'admin' && userProfile?.role !== 'teacher')) return;
+    if (!user || !userProfile || user.uid !== userProfile.uid) return;
+    if (userProfile.role !== 'admin' && userProfile.role !== 'teacher') return;
 
-    const unsubTeachers = userProfile?.role === 'admin' 
+    const unsubTeachers = userProfile.role === 'admin' 
       ? onSnapshot(collection(db, 'users'), 
           (snap) => {
             const users = snap.docs.map(doc => ({ uid: doc.id, ...doc.data() } as Teacher));
             // Filter out admins from being treated as teachers
-            setAllTeachers(users.filter(u => u.role !== 'admin' && !u.email?.includes('admin') && u.name !== 'SSM Admin' && u.name !== 'Master Admin' && u.name !== 'Jitendra Kumar Tripathi'));
+            setAllTeachers(users.filter(u => u.role !== 'admin' && !(u.email || '').includes('admin') && u.name !== 'SSM Admin' && u.name !== 'Master Admin' && u.name !== 'Jitendra Kumar Tripathi'));
           },
           (error) => handleFirestoreError(error, OperationType.LIST, 'users')
         )
@@ -651,6 +654,13 @@ export default function App() {
       (error) => handleFirestoreError(error, OperationType.LIST, 'holidays')
     );
 
+    const unsubTimetable = onSnapshot(doc(db, 'settings', 'timetable'), 
+      (snap) => {
+        if (snap.exists()) setTimetable(snap.data().entries || []);
+      },
+      (error) => handleFirestoreError(error, OperationType.GET, 'settings/timetable')
+    );
+
     const unsubRequirements = onSnapshot(doc(db, 'settings', 'subjectRequirements'), 
       (snap) => {
         if (snap.exists()) setSubjectRequirements(snap.data().requirements || []);
@@ -679,6 +689,7 @@ export default function App() {
       unsubArrangements();
       unsubStudentAtt();
       unsubHolidays();
+      unsubTimetable();
       unsubRequirements();
       unsubCode();
     };
@@ -686,25 +697,50 @@ export default function App() {
 
   // --- Admin Logic ---
 
-  const markTodayAsHoliday = async () => {
-    const today = format(new Date(), 'yyyy-MM-dd');
-    const isSunday = getDay(new Date()) === 0;
-    const defaultReason = isSunday ? 'Sunday' : 'Public Holiday';
-    
-    // Use a simple prompt but handle it better
-    const reason = window.prompt("Enter holiday reason:", defaultReason);
-    if (!reason && reason !== "") return;
+  const handleMarkHolidayRange = async (e: React.FormEvent) => {
+    e.preventDefault();
+    const days = eachDayOfInterval({
+      start: parseISO(holidayForm.startDate),
+      end: parseISO(holidayForm.endDate)
+    });
 
     try {
-      const holidayReason = reason || defaultReason;
-      await setDoc(doc(db, 'holidays', today), {
-        date: today,
-        reason: holidayReason
-      });
-      alert(`Holiday "${holidayReason}" Marked for Today!`);
+      setLoginLoading(true); // Re-using login loading state for simplicity
+      for (const day of days) {
+        const dateStr = format(day, 'yyyy-MM-dd');
+        await setDoc(doc(db, 'holidays', dateStr), {
+          date: dateStr,
+          reason: holidayForm.reason || 'Public Holiday'
+        });
+      }
+      alert(`Holidays marked successfully for ${days.length} days!`);
+      setShowHolidayModal(false);
+      setHolidayForm({ startDate: format(new Date(), 'yyyy-MM-dd'), endDate: format(new Date(), 'yyyy-MM-dd'), reason: '' });
     } catch (err) {
-      console.error("Holiday Error:", err);
-      alert("Error marking holiday. Please check connection.");
+      console.error("Holiday Range Error:", err);
+      alert("Error marking holidays. Please check connection.");
+    } finally {
+      setLoginLoading(false);
+    }
+  };
+
+  const handleLeaveAction = async (id: string, status: 'approved' | 'rejected' | 'pending') => {
+    if (status !== 'pending' && !window.confirm(`Are you sure you want to ${status.toUpperCase()} this leave request?`)) return;
+    if (status === 'pending' && !window.confirm("Move back to pending for re-evaluation?")) return;
+    
+    try {
+      setLoginLoading(true);
+      await updateDoc(doc(db, 'leaves', id), { status });
+      alert(`Status updated to ${status} successfully.`);
+    } catch (err: any) {
+      console.error("Leave Action Error:", err);
+      if (err.message.includes('permission')) {
+        alert("Permission Denied: You do not have the required administrator privileges to perform this action.");
+      } else {
+        alert("Update Failed: " + err.message);
+      }
+    } finally {
+      setLoginLoading(false);
     }
   };
 
@@ -1173,14 +1209,8 @@ export default function App() {
                 
                 <div className="flex flex-col md:flex-row gap-6 w-full max-w-md mx-auto mb-16">
                   <button 
-                    onClick={() => {
-                      if (userProfile) {
-                        setView(userProfile.role === 'admin' ? 'adminPortal' : 'teacherPortal');
-                      } else {
-                        setView('loginSelection');
-                      }
-                    }}
-                    className="flex-1 bg-indigo-600 text-white px-8 py-5 rounded-3xl font-black text-lg hover:bg-indigo-700 hover:shadow-2xl hover:shadow-indigo-600/20 hover:-translate-y-1 transition-all flex items-center justify-center gap-3"
+                    onClick={() => setView('loginSelection')}
+                    className="flex-1 bg-indigo-600 text-white px-8 py-5 rounded-3xl font-black text-lg hover:bg-indigo-700 hover:shadow-2xl hover:shadow-indigo-600/20 hover:-translate-y-1 transition-all flex items-center justify-center gap-3 w-full"
                   >
                     LOGIN TO PORTAL <ArrowUpRight className="w-6 h-6" />
                   </button>
@@ -1209,6 +1239,86 @@ export default function App() {
                 </div>
               </div>
             </motion.div>
+          )}
+
+          {editingTeacher && (
+             <div className="fixed inset-0 z-[60] bg-indigo-950/40 backdrop-blur-sm flex items-center justify-center p-6">
+                <motion.div initial={{ scale: 0.9, opacity: 0 }} animate={{ scale: 1, opacity: 1 }} className="bg-white w-full max-w-2xl rounded-[3rem] shadow-2xl overflow-hidden border-4 border-white">
+                   <div className="bg-indigo-900 p-8 text-white flex justify-between items-center">
+                      <div>
+                        <h4 className="text-2xl font-black uppercase italic tracking-tighter">Edit Faculty Member</h4>
+                        <p className="text-[10px] font-bold text-indigo-300 uppercase tracking-[0.2em]">Update profile information and access</p>
+                      </div>
+                      <button onClick={() => { setEditingTeacher(null); setIsEditingProfile(false); }} className="p-3 bg-white/10 hover:bg-white text-white hover:text-indigo-900 rounded-2xl transition-all shadow-xl"><X className="w-6 h-6"/></button>
+                   </div>
+                   <div className="p-10 overflow-y-auto max-h-[70vh]">
+                      <form onSubmit={async (e) => {
+                         e.preventDefault();
+                         const formData = new FormData(e.target as HTMLFormElement);
+                         const updated = {
+                           ...editingTeacher,
+                           name: formData.get('name') as string,
+                           mobile: formData.get('mobile') as string,
+                           email: formData.get('email') as string,
+                           password: formData.get('password') as string,
+                           classes: FLattenClasses.filter((_, i) => (document.getElementById(`edit-class-${i}`) as HTMLInputElement)?.checked),
+                           subjects: schoolSettings.subjects.filter((_, i) => (document.getElementById(`edit-sub-${i}`) as HTMLInputElement)?.checked)
+                         };
+                         
+                         await updateDoc(doc(db, 'users', editingTeacher.uid), updated);
+                         if (isEditingProfile) setUserProfile(updated);
+                         setEditingTeacher(null);
+                         setIsEditingProfile(false);
+                         alert("Profile Updated Successfully!");
+                      }} className="space-y-8">
+                         <div className="grid md:grid-cols-2 gap-8">
+                            <div className="space-y-2">
+                               <label className="text-[10px] font-black text-gray-400 uppercase ml-2">Display Name</label>
+                               <input name="name" type="text" defaultValue={editingTeacher.name} required className="w-full px-6 py-4 bg-gray-50 border border-indigo-50 rounded-2xl outline-none focus:border-indigo-600 font-bold transition-all" />
+                            </div>
+                            <div className="space-y-2">
+                               <label className="text-[10px] font-black text-gray-400 uppercase ml-2">Mobile Number</label>
+                               <input name="mobile" type="tel" defaultValue={editingTeacher.mobile} required className="w-full px-6 py-4 bg-gray-50 border border-indigo-50 rounded-2xl outline-none focus:border-indigo-600 font-bold transition-all" />
+                            </div>
+                            <div className="space-y-2">
+                               <label className="text-[10px] font-black text-gray-400 uppercase ml-2">Official Email</label>
+                               <input name="email" type="email" defaultValue={editingTeacher.email} required className="w-full px-6 py-4 bg-gray-50 border border-indigo-50 rounded-2xl outline-none focus:border-indigo-600 font-bold transition-all" />
+                            </div>
+                            <div className="space-y-2">
+                               <label className="text-[10px] font-black text-gray-400 uppercase ml-2">Login Password</label>
+                               <input name="password" type="text" defaultValue={editingTeacher.password || 'SSM_PORTAL'} required className="w-full px-6 py-4 bg-gray-50 border border-indigo-50 rounded-2xl outline-none focus:border-indigo-600 font-bold transition-all" />
+                            </div>
+                         </div>
+
+                         <div className="space-y-4">
+                            <label className="text-[10px] font-black text-indigo-600 uppercase tracking-widest block border-b border-indigo-100 pb-2">Assigned Classes</label>
+                            <div className="grid grid-cols-4 sm:grid-cols-6 gap-3">
+                               {FLattenClasses.map((c, i) => (
+                                 <label key={c} className={`p-3 rounded-xl border text-[10px] font-black text-center cursor-pointer transition-all ${(editingTeacher?.classes || []).includes(c) ? 'bg-indigo-600 text-white border-indigo-600' : 'bg-gray-50 border-gray-100 text-gray-400 hover:border-indigo-200'}`}>
+                                   <input id={`edit-class-${i}`} type="checkbox" className="hidden" defaultChecked={(editingTeacher?.classes || []).includes(c)} onChange={(e) => { e.target.parentElement?.classList.toggle('bg-indigo-600'); e.target.parentElement?.classList.toggle('text-white'); }} />
+                                   {c}
+                                 </label>
+                               ))}
+                            </div>
+                         </div>
+
+                         <div className="space-y-4">
+                            <label className="text-[10px] font-black text-indigo-600 uppercase tracking-widest block border-b border-indigo-100 pb-2">Teaching Subjects</label>
+                            <div className="flex flex-wrap gap-2">
+                               {(schoolSettings?.subjects || []).map((sub, i) => (
+                                 <label key={sub} className={`px-4 py-2 rounded-xl border text-[10px] font-bold cursor-pointer transition-all ${(editingTeacher?.subjects || []).includes(sub) ? 'bg-indigo-600 text-white border-indigo-600' : 'bg-gray-50 border-gray-100 text-gray-600 hover:border-indigo-200'}`}>
+                                   <input id={`edit-sub-${i}`} type="checkbox" className="hidden" defaultChecked={(editingTeacher?.subjects || []).includes(sub)} onChange={(e) => { e.target.parentElement?.classList.toggle('bg-indigo-600'); e.target.parentElement?.classList.toggle('text-white'); }} />
+                                   {sub}
+                                 </label>
+                               ))}
+                            </div>
+                         </div>
+
+                         <button type="submit" className="w-full bg-indigo-900 text-white font-black py-5 rounded-[2rem] shadow-2xl hover:bg-black transition-all uppercase tracking-widest mt-4">SAVE CHANGES AND SYNC</button>
+                      </form>
+                   </div>
+                </motion.div>
+             </div>
           )}
 
           {view === 'loginSelection' && (
@@ -1284,8 +1394,9 @@ export default function App() {
                         className="w-full flex items-center justify-center gap-3 py-3.5 bg-white border-2 border-indigo-50 rounded-2xl font-bold text-gray-700 hover:bg-indigo-50 transition-all shadow-sm"
                       >
                         <img src="https://www.gstatic.com/firebasejs/ui/2.0.0/images/auth/google.svg" className="w-5 h-5" alt="Google" referrerPolicy="no-referrer" />
-                        Continue with Google
+                        Continue with Owner Google (Recovery)
                       </button>
+                      <p className="text-[9px] text-center text-gray-400 font-bold px-4 leading-relaxed">Use this if the Master Admin ID or Password fails.</p>
                     </div>
                   )}
 
@@ -1459,11 +1570,11 @@ export default function App() {
                           <span className="font-bold text-xs">EXPORT ATTENDANCE</span>
                         </button>
                         <button 
-                          onClick={markTodayAsHoliday}
+                          onClick={() => setShowHolidayModal(true)}
                           className="p-6 bg-orange-50 rounded-3xl border-2 border-orange-100 flex flex-col items-center gap-3 hover:bg-orange-600 hover:text-white transition-all group"
                         >
                           <Calendar className="w-10 h-10 text-orange-600 group-hover:text-white" />
-                          <span className="font-bold text-xs">MARK TODAY HOLIDAY</span>
+                          <span className="font-bold text-xs uppercase">Mark Holiday</span>
                         </button>
                       </div>
                     </Card>
@@ -1542,7 +1653,7 @@ export default function App() {
                       }
                     >
                        <div className="grid md:grid-cols-2 lg:grid-cols-3 gap-6">
-                          {arrangements.find(a => a.date === format(arrangementDate, 'yyyy-MM-dd'))?.substitutions.reduce((acc: any[], sub) => {
+                          {(arrangements.find(a => a.date === format(arrangementDate, 'yyyy-MM-dd'))?.substitutions || []).reduce((acc: any[], sub) => {
                              let existing = acc.find(x => x.absentTeacherId === sub.absentTeacherId);
                              if (existing) {
                                existing.subs.push(sub);
@@ -1640,7 +1751,7 @@ export default function App() {
                        </div>
                        
                        <div className="grid md:grid-cols-2 lg:grid-cols-3 gap-8">
-                        {arrangements.find(a => a.date === format(new Date(), 'yyyy-MM-dd'))?.substitutions.reduce((acc: any[], sub) => {
+                        {(arrangements.find(a => a.date === format(new Date(), 'yyyy-MM-dd'))?.substitutions || []).reduce((acc: any[], sub) => {
                            let existing = acc.find(x => x.absentTeacherId === sub.absentTeacherId);
                            if (existing) {
                              existing.subs.push(sub);
@@ -1702,12 +1813,12 @@ export default function App() {
                                </div>
                                {l.status === 'pending' && (
                                  <div className="flex gap-4">
-                                    <button onClick={async () => { if(confirm("Approve this leave?")) await updateDoc(doc(db, 'leaves', l.id), { status: 'approved' }); }} className="flex-1 bg-green-500 text-white font-black py-4 rounded-xl text-xs hover:bg-green-600 shadow-lg shadow-green-100 uppercase transition-all">Approve</button>
-                                    <button onClick={async () => { if(confirm("Reject this leave?")) await updateDoc(doc(db, 'leaves', l.id), { status: 'rejected' }); }} className="flex-1 bg-red-100 text-red-500 font-black py-4 rounded-xl text-xs hover:bg-red-500 hover:text-white uppercase transition-all">Reject</button>
+                                    <button onClick={() => handleLeaveAction(l.id, 'approved')} className="flex-1 bg-green-500 text-white font-black py-4 rounded-xl text-xs hover:bg-green-600 shadow-lg shadow-green-100 uppercase transition-all">Approve</button>
+                                    <button onClick={() => handleLeaveAction(l.id, 'rejected')} className="flex-1 bg-red-100 text-red-500 font-black py-4 rounded-xl text-xs hover:bg-red-500 hover:text-white uppercase transition-all">Reject</button>
                                  </div>
                                )}
                                {l.status !== 'pending' && (
-                                 <button onClick={async () => { if(confirm("Move back to pending for re-evaluation?")) await updateDoc(doc(db, 'leaves', l.id), { status: 'pending' }); }} className="w-full py-4 border-2 border-dashed border-gray-100 rounded-xl text-[10px] font-black text-gray-400 uppercase tracking-widest hover:border-indigo-200 hover:text-indigo-400 transition-all">Reset Status</button>
+                                 <button onClick={() => handleLeaveAction(l.id, 'pending')} className="w-full py-4 border-2 border-dashed border-gray-100 rounded-xl text-[10px] font-black text-gray-400 uppercase tracking-widest hover:border-indigo-200 hover:text-indigo-400 transition-all">Reset Status</button>
                                )}
                             </div>
                           ))}
@@ -1782,7 +1893,18 @@ export default function App() {
                                      <span className="font-black text-indigo-600">{totalAtt}</span> <span className="text-[10px] text-gray-400">/ 200</span>
                                   </td>
                                   <td className="px-6 py-4 text-center">
-                                     <button onClick={async () => { if(confirm(`Delete ${t.name}?`)) await deleteDoc(doc(db, 'users', t.uid)); }} className="text-red-400 hover:text-red-600"><Trash2 className="w-4 h-4"/></button>
+                                     <div className="flex items-center justify-center gap-3">
+                                       <button 
+                                         onClick={() => {
+                                           setEditingTeacher(t);
+                                           setIsEditingProfile(false);
+                                         }}
+                                         className="text-indigo-400 hover:text-indigo-600 p-2 hover:bg-indigo-50 rounded-lg transition-all"
+                                       >
+                                         <Settings className="w-4 h-4"/>
+                                       </button>
+                                       <button onClick={async () => { if(confirm(`Delete ${t.name}?`)) await deleteDoc(doc(db, 'users', t.uid)); }} className="text-red-400 hover:text-red-600 p-2 hover:bg-red-50 rounded-lg transition-all"><Trash2 className="w-4 h-4"/></button>
+                                     </div>
                                   </td>
                                 </tr>
                               );
@@ -2037,6 +2159,19 @@ export default function App() {
                           </button>
                           <p className="text-[9px] text-gray-400 font-bold mt-2 text-center uppercase">Current Session: {new Date().getFullYear()}-{ (new Date().getFullYear() + 1).toString().slice(-2) }</p>
                        </div>
+
+                       <div className="bg-orange-50 p-4 rounded-2xl border border-orange-100">
+                           <p className="text-[10px] font-black text-orange-400 uppercase mb-3">Profile Settings</p>
+                           <button 
+                             onClick={() => {
+                               setEditingTeacher(userProfile);
+                               setIsEditingProfile(true);
+                             }}
+                             className="w-full bg-white text-orange-600 border border-orange-200 py-3 rounded-xl font-black text-xs hover:bg-orange-600 hover:text-white transition-all uppercase flex items-center justify-center gap-2"
+                           >
+                              <Settings className="w-4 h-4" /> Edit My Profile
+                           </button>
+                        </div>
                      </div>
                   </Card>
 
@@ -2111,12 +2246,120 @@ export default function App() {
                        )}
                      </div>
                   </Card>
-               </div>
+                </div>
+
+                <div className="grid md:grid-cols-2 gap-8 mt-10">
+                   <Card title="Previous Leave Requests History" icon={History}>
+                      <div className="space-y-4 max-h-[400px] overflow-y-auto pr-2 text-xs">
+                        {leaves.filter(l => l.teacherId === user.uid).sort((a,b) => b.startDate.localeCompare(a.startDate)).map(l => (
+                          <div key={l.id} className="p-4 bg-gray-50 rounded-2xl border flex justify-between items-center group">
+                            <div>
+                               <p className="font-black text-indigo-950 uppercase text-[10px]">Reason: {l.reason}</p>
+                               <p className="text-[9px] text-gray-500 font-bold uppercase">{l.startDate} » {l.endDate}</p>
+                            </div>
+                            <span className={`px-3 py-1 rounded-full text-[9px] font-black uppercase tracking-widest border ${
+                              l.status === 'approved' ? 'bg-green-50 text-green-600 border-green-100' : 
+                              l.status === 'rejected' ? 'bg-red-50 text-red-600 border-red-100' : 'bg-orange-50 text-orange-600 border-orange-100'
+                            }`}>{l.status}</span>
+                          </div>
+                        ))}
+                        {leaves.filter(l => l.teacherId === user.uid).length === 0 && (
+                          <div className="text-center py-10 opacity-30 italic text-[10px]">No previous leave requests found.</div>
+                        )}
+                      </div>
+                   </Card>
+
+                   <Card title="Recorded Class Attendance History" icon={UserCheck}>
+                      <div className="space-y-4 max-h-[400px] overflow-y-auto pr-2">
+                        {studentAttendance.filter(sa => sa.recordedBy === user.uid).sort((a,b) => b.date.localeCompare(a.date)).map(sa => (
+                          <div key={sa.id} className="p-4 bg-gray-50 rounded-2xl border flex justify-between items-center group">
+                            <div>
+                               <p className="font-black text-indigo-950 italic text-[10px]">CLASS {sa.class}</p>
+                               <p className="text-[9px] text-gray-500 font-bold uppercase">{sa.date}</p>
+                            </div>
+                            <div className="text-right">
+                               <p className="text-[10px] font-black text-green-600">PRES: {sa.present}</p>
+                               <p className="text-[10px] font-black text-red-600">ABS: {sa.absent}</p>
+                            </div>
+                          </div>
+                        ))}
+                        {studentAttendance.filter(sa => sa.recordedBy === user.uid).length === 0 && (
+                          <div className="text-center py-10 opacity-30 italic text-[10px]">No previously recorded attendance found.</div>
+                        )}
+                      </div>
+                   </Card>
+                </div>
             </motion.div>
           )}
+           {view === 'adminPortal' && showHolidayModal && (
+              <div className="fixed inset-0 bg-indigo-950/80 backdrop-blur-md z-[100] flex items-center justify-center p-6">
+                <motion.div 
+                  initial={{ opacity: 0, scale: 0.95 }}
+                  animate={{ opacity: 1, scale: 1 }}
+                  className="w-full max-w-md bg-white rounded-[3rem] shadow-2xl overflow-hidden border-8 border-white"
+                >
+                  <div className="bg-orange-600 p-8 text-white flex justify-between items-center">
+                    <div>
+                      <h2 className="text-2xl font-black uppercase tracking-tighter">Mark School Holiday</h2>
+                      <p className="text-orange-100 text-[10px] font-bold uppercase tracking-widest mt-1">Select date range and reason</p>
+                    </div>
+                    <button onClick={() => setShowHolidayModal(false)} className="bg-orange-700/50 p-2 rounded-xl">
+                      <X className="w-5 h-5" />
+                    </button>
+                  </div>
+                  <form onSubmit={handleMarkHolidayRange} className="p-8 space-y-6">
+                    <div className="grid grid-cols-2 gap-4">
+                      <div className="space-y-2">
+                        <label className="text-[10px] font-black text-gray-400 uppercase ml-2">Start Date</label>
+                        <input 
+                          type="date" 
+                          required 
+                          value={holidayForm.startDate}
+                          onChange={e => setHolidayForm({...holidayForm, startDate: e.target.value})}
+                          className="w-full px-4 py-3 bg-gray-50 border border-orange-100 rounded-2xl font-bold text-xs"
+                        />
+                      </div>
+                      <div className="space-y-2">
+                        <label className="text-[10px] font-black text-gray-400 uppercase ml-2">End Date</label>
+                        <input 
+                          type="date" 
+                          required 
+                          value={holidayForm.endDate}
+                          onChange={e => setHolidayForm({...holidayForm, endDate: e.target.value})}
+                          className="w-full px-4 py-3 bg-gray-50 border border-orange-100 rounded-2xl font-bold text-xs"
+                        />
+                      </div>
+                    </div>
+                    <div className="space-y-2">
+                      <label className="text-[10px] font-black text-gray-400 uppercase ml-2">Holiday Reason</label>
+                      <input 
+                        type="text" 
+                        placeholder="e.g. Diwali Break / Summer Vacation"
+                        required 
+                        value={holidayForm.reason}
+                        onChange={e => setHolidayForm({...holidayForm, reason: e.target.value})}
+                        className="w-full px-6 py-4 bg-gray-50 border border-orange-100 rounded-2xl text-sm font-bold"
+                      />
+                    </div>
+                    <button 
+                      type="submit" 
+                      className="w-full bg-orange-600 text-white font-black py-5 rounded-[2rem] hover:bg-orange-700 transition-all shadow-xl shadow-orange-100 uppercase tracking-widest"
+                    >
+                      CONFIRM HOLIDAY RANGE
+                    </button>
+                  </form>
+                </motion.div>
+              </div>
+           )}
         </AnimatePresence>
       </div>
     </div>
+    <footer className="max-w-7xl mx-auto px-6 py-8 mt-10 border-t border-indigo-50 text-center">
+      <p className="text-[10px] font-black text-indigo-400 uppercase tracking-[0.2em] leading-relaxed">
+        © 2026 saraswati shishu mandir senior secondary school, Suryakund, gorakhpur<br/>
+        <span className="opacity-50">|| designed and developed by Shubhjeet Ram Tripathi ||</span>
+      </p>
+    </footer>
     </ErrorBoundary>
   );
 }

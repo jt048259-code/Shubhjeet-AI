@@ -84,12 +84,23 @@
       "schema": "LeaveApplication",
       "description": "Leave requests"
     },
-    "/timetable/{tableId}": {
-      "schema": "TimeTable",
-      "description": "Time table records"
-    },
     "/settings/school": {
       "description": "Global school settings like subjects and classes"
+    },
+    "/settings/timetable": {
+      "description": "Full school timetable entries"
+    },
+    "/settings/subjectRequirements": {
+      "description": "Staff requirements per subject"
+    },
+    "/arrangements/{arrangementId}": {
+      "description": "Daily substitution arrangements"
+    },
+    "/studentAttendance/{attId}": {
+      "description": "Daily student attendance summary"
+    },
+    "/holidays/{holidayId}": {
+      "description": "School holidays"
     }
   }
 }

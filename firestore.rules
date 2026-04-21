@@ -3,77 +3,159 @@ service cloud.firestore {
   match /databases/{database}/documents {
     
     // ===============================================================
-    // Helper Functions
+    // 0. GLOBAL SAFETY NET
     // ===============================================================
-    function isAuthenticated() {
-      return request.auth != null;
+    match /{document=**} {
+      allow read, write: if false;
     }
+
+    // ===============================================================
+    // HELPER FUNCTIONS
+    // ===============================================================
+    function isSignedIn() { return request.auth != null; }
+    function incoming() { return request.resource.data; }
+    function existing() { return resource.data; }
     
-    function getUserData() {
-      return get(/databases/$(database)/documents/users/$(request.auth.uid)).data;
+    // ID Poisoning Guard
+    function isValidId(id) { 
+      return id is string && id.size() <= 128 && id.matches('^[a-zA-Z0-9_\\-]+$'); 
     }
-    
+
+    // Tiered Identity Logic
     function isAdmin() {
-      return isAuthenticated() && 
-        (request.auth.token.email == "jitendrakumart557@gmail.com" || 
-         request.auth.token.email == "admin@ssm.portal" ||
-         get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin');
+      return isSignedIn() && (
+        request.auth.token.email == "jitendrakumart557@gmail.com" || 
+        request.auth.token.email == "admin@ssm.portal" ||
+        get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'admin'
+      );
     }
     
-    function isTeacher() {
-      return isAuthenticated() && get(/databases/$(database)/documents/users/$(request.auth.uid)).data.role == 'teacher';
-    }
-
-    function isOwner(userId) {
-      return isAuthenticated() && request.auth.uid == userId;
+    function isOwner(uid) { 
+      return isSignedIn() && request.auth.uid == uid; 
     }
 
     // ===============================================================
-    // Rules
+    // VALIDATION BLUEPRINTS
+    // ===============================================================
+    
+    function isValidUser(data) {
+      return data.uid is string && isValidId(data.uid) &&
+             data.name is string && data.name.size() > 0 && data.name.size() <= 100 &&
+             data.role in ['teacher', 'admin'] &&
+             (data.email is string || !('email' in data)) &&
+             (data.mobile is string || !('mobile' in data)) &&
+             (data.classes is list || !('classes' in data)) &&
+             (data.subjects is list || !('subjects' in data));
+    }
+
+    function isValidAttendance(data) {
+      return data.teacherId is string && isValidId(data.teacherId) &&
+             data.date is string && data.date.matches('^\\d{4}-\\d{2}-\\d{2}$') &&
+             data.teacherName is string && data.teacherName.size() <= 100 &&
+             data.timestamp != null;
+    }
+
+    function isValidLeave(data) {
+      return data.teacherId is string && isValidId(data.teacherId) &&
+             data.status in ['pending', 'approved', 'rejected'] &&
+             data.startDate is string && data.startDate.size() == 10 &&
+             data.endDate is string && data.endDate.size() == 10 &&
+             data.reason is string && data.reason.size() <= 1000;
+    }
+
+    // ===============================================================
+    // COLLECTION RULES
     // ===============================================================
 
+    // --- USERS ---
     match /users/{userId} {
-      allow read: if isOwner(userId) || isAdmin();
-      allow create: if isAuthenticated();
-      allow update: if isAuthenticated() && (isOwner(userId) || isAdmin());
+      allow get: if isOwner(userId) || isAdmin();
+      allow list: if isAdmin();
+      
+      allow create: if isSignedIn() && isValidUser(incoming()) && 
+                    incoming().uid == request.auth.uid &&
+                    incoming().role == 'teacher'; // Only teachers can self-register
+      
+      allow update: if isSignedIn() && isValidUser(incoming()) && (
+        // Admin update: can change anything except UID
+        (isAdmin() && incoming().uid == existing().uid) || 
+        // Self update: restricted fields
+        (isOwner(userId) && 
+         incoming().role == existing().role && 
+         incoming().uid == existing().uid &&
+         incoming().diff(existing()).affectedKeys().hasOnly(['name', 'mobile', 'classes', 'subjects', 'password', 'email'])
+        )
+      );
     }
 
-    match /attendanceCodes/{codeId} {
-      allow read: if isAuthenticated();
-      allow write: if isAdmin();
-    }
-
-    match /attendance/{recordId} {
-      allow read: if isAdmin() || (isAuthenticated() && (resource == null || resource.data.teacherId == request.auth.uid));
-      allow create: if isAuthenticated();
+    // --- ATTENDANCE ---
+    match /attendance/{atId} {
+      allow get, list: if isAdmin() || (isSignedIn() && resource.data.teacherId == request.auth.uid);
+      
+      allow create: if isSignedIn() && isValidAttendance(incoming()) && (
+        isAdmin() || (
+          incoming().teacherId == request.auth.uid &&
+          exists(/databases/$(database)/documents/users/$(request.auth.uid))
+        )
+      );
       allow update, delete: if isAdmin();
     }
 
-    match /leaves/{leaveId} {
-      allow read: if isAdmin() || (isAuthenticated() && (resource == null || resource.data.teacherId == request.auth.uid));
-      allow create: if isAuthenticated();
-      allow update: if isAdmin() || (isAuthenticated() && resource.data.teacherId == request.auth.uid && request.resource.data.status == resource.data.status);
+    // --- LEAVES ---
+    match /leaves/{lId} {
+      allow get, list: if isAdmin() || (isSignedIn() && resource.data.teacherId == request.auth.uid);
+      
+      allow create: if isSignedIn() && isValidLeave(incoming()) && (
+        isAdmin() || (
+          incoming().teacherId == request.auth.uid &&
+          incoming().status == 'pending' &&
+          exists(/databases/$(database)/documents/users/$(request.auth.uid))
+        )
+      );
+      
+      allow update: if isSignedIn() && (
+        // Admin can approve/reject
+        isAdmin() || 
+        // Teacher can update pending leave reason/dates
+        (isOwner(existing().teacherId) && 
+         existing().status == 'pending' &&
+         incoming().status == 'pending' &&
+         incoming().teacherId == existing().teacherId &&
+         incoming().diff(existing()).affectedKeys().hasOnly(['reason', 'startDate', 'endDate', 'mobile'])
+        )
+      );
+      
       allow delete: if isAdmin();
     }
 
+    // --- ATTENDANCE CODES ---
+    match /attendanceCodes/{codeId} {
+      allow read: if isSignedIn();
+      allow write: if isAdmin();
+    }
+
+    // --- SETTINGS ---
     match /settings/{settingId} {
-      allow read: if isAuthenticated() || settingId == 'school';
+      allow read: if isSignedIn() || settingId == 'school';
       allow write: if isAdmin();
     }
 
-    match /arrangements/{arrangementId} {
-      allow read: if isAuthenticated();
+    // --- ARRANGEMENTS ---
+    match /arrangements/{id} {
+      allow read: if isSignedIn();
       allow write: if isAdmin();
     }
 
-    match /studentAttendance/{attId} {
-      allow read: if isAuthenticated();
-      allow create: if isAuthenticated();
+    // --- STUDENT ATTENDANCE ---
+    match /studentAttendance/{id} {
+      allow read: if isSignedIn();
+      allow create: if isSignedIn();
       allow update, delete: if isAdmin();
     }
 
-    match /holidays/{holidayId} {
-      allow read: if isAuthenticated();
+    // --- HOLIDAYS ---
+    match /holidays/{id} {
+      allow read: if isSignedIn();
       allow write: if isAdmin();
     }
   }
