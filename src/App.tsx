@@ -27,7 +27,7 @@ import {
   format, startOfMonth, endOfMonth, eachDayOfInterval, 
   isPast, isToday, addMonths, subMonths, getDay, 
   parseISO, isAfter, startOfDay, endOfDay, addDays, subDays,
-  isSameMonth, startOfYear
+  isSameMonth, startOfYear, addMinutes
 } from 'date-fns';
 import { motion, AnimatePresence } from 'motion/react';
 import { generateTimetableAI, suggestSubstitutionAI, TimetableEntry, SubjectRequirement } from './services/geminiService';
@@ -719,6 +719,26 @@ export default function App() {
     } catch (err) {
       console.error("Holiday Range Error:", err);
       alert("Error marking holidays. Please check connection.");
+    } finally {
+      setLoginLoading(false);
+    }
+  };
+
+  const handleGenerateAttendanceCode = async () => {
+    const code = Math.floor(100000 + Math.random() * 900000).toString();
+    const expiresAt = addMinutes(new Date(), 60).toISOString(); // Codes expire in 1 hour
+    try {
+      setLoginLoading(true);
+      await addDoc(collection(db, 'attendanceCodes'), {
+        code,
+        expiresAt,
+        createdAt: serverTimestamp(),
+        createdBy: user.uid
+      });
+      alert(`New 6-Digit Code Generated: ${code}\nThis code will expire in 60 minutes.\nShare this with teachers for today's attendance.`);
+    } catch (err: any) {
+      console.error("Code Generation Error:", err);
+      alert("Error generating code: " + err.message);
     } finally {
       setLoginLoading(false);
     }
@@ -1576,6 +1596,14 @@ export default function App() {
                           <Calendar className="w-10 h-10 text-orange-600 group-hover:text-white" />
                           <span className="font-bold text-xs uppercase">Mark Holiday</span>
                         </button>
+                        <button 
+                          onClick={handleGenerateAttendanceCode}
+                          className="p-6 bg-green-50 rounded-3xl border-2 border-green-100 flex flex-col items-center gap-3 hover:bg-green-600 hover:text-white transition-all group relative overflow-hidden"
+                        >
+                           <div className="absolute top-2 right-2 bg-green-500 text-white text-[8px] font-black px-2 py-0.5 rounded-full animate-pulse">NEW</div>
+                          <Lock className="w-10 h-10 text-green-600 group-hover:text-white" />
+                          <span className="font-bold text-xs uppercase text-center">Generate 6-Digit Code</span>
+                        </button>
                       </div>
                     </Card>
 
@@ -1599,6 +1627,24 @@ export default function App() {
 
               {activeAdminSection === 'attendance' && (
                 <div className="space-y-8">
+                  <div className="grid md:grid-cols-3 gap-6">
+                    <div className="bg-white p-6 rounded-[2rem] border-2 border-green-50 shadow-sm flex flex-col items-center justify-center gap-4">
+                       <p className="text-[10px] font-black text-gray-400 uppercase tracking-widest text-center">Current Live Code</p>
+                       <div className="text-4xl font-black text-green-600 tracking-tighter bg-green-50 px-8 py-3 rounded-2xl border-2 border-green-100">
+                         {attendanceCode || '------'}
+                       </div>
+                       <button 
+                        onClick={handleGenerateAttendanceCode}
+                        className="w-full bg-green-600 text-white py-3 rounded-xl font-black text-[10px] uppercase tracking-widest hover:bg-green-700 transition-all shadow-lg shadow-green-100"
+                       >
+                         {attendanceCode ? 'GENERATE NEW CODE' : 'GENERATE ATTENDANCE CODE'}
+                       </button>
+                       {attendanceCode && (
+                         <p className="text-[8px] font-black text-green-400 uppercase">Code is active for 60 minutes</p>
+                       )}
+                    </div>
+                  </div>
+
                   <Card title="Master Attendance Archive" icon={CalendarCheck} headerAction={
                     <div className="flex items-center gap-4 bg-white/10 p-1 rounded-xl">
                        <button onClick={() => setCurrentMonth(subMonths(currentMonth, 1))} className="p-1 hover:bg-white/20 rounded text-white"><ChevronLeft className="w-4 h-4"/></button>
