@@ -2403,7 +2403,7 @@ export default function App() {
     <footer className="max-w-7xl mx-auto px-6 py-8 mt-10 border-t border-indigo-50 text-center">
       <p className="text-[10px] font-black text-indigo-400 uppercase tracking-[0.2em] leading-relaxed">
         © 2026 saraswati shishu mandir senior secondary school, Suryakund, gorakhpur<br/>
-        <span className="opacity-100">|| designed and developed by SHUBHJEET RAM TRIPATHI and ABHINAV SHARMA||</span>
+        <span className="opacity-100">|| designed and developed by SHUBHJEET RAM TRIPATHI||</span>
       </p>
     </footer>
     </ErrorBoundary>
